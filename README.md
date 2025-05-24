@@ -110,16 +110,3 @@ save_name = "Alpaca_{}".format(model_key) + \
             f"_dim_{args.project_dimension}_run_{args.run}" 
 file_dir = os.path.join("./results/", save_name)
 ```
-
-### Other Operations
-
-Collect ground-truth empirical fine-tuned model losses. 
-
-Use `sample_train_results_alpaca.py`
-```
-python sample_train_results_alpaca.py \
-    --model_key $model_key --precision 32 --lr 5e-5\
-    --load_sample_task_dir Alpaca_EleutherAI-gpt-neo-125M_lora_r_4 --devices 0 1 2 --subset_num 100\
-    --save_name $save_name
-```
-

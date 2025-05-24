@@ -1,6 +1,6 @@
-conda create -n adap python=3.10
+conda create -n ensemble python=3.10
 
-conda activate adap
+conda activate ensemble
 
 pip install -r ./requirement.txt 
 
@@ -30,6 +30,3 @@ pip install pytorch-quantization==2.1.3 --extra-index-url https://pypi.ngc.nvidi
 
 pip install lightning==2.2.5
 pip install pytorch-lightning==2.2.5
-git clone https://github.com/bigscience-workshop/promptsource.git
-cd promptsource
-pip install -e .
