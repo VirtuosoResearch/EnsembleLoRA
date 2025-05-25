@@ -35,25 +35,13 @@ pip install pytorch-lightning==2.2.5
 
 ## Usage of Adapter
 
-training adapter script: `~/Quantized-boosting-code/quantized-finetuning/scripts/train_glue/train_adapter.sh`
+We have implemented `LoRA`, `Bottleneck Adapter`, `QLoRA`, `Quantized Bottleneck Adapter`. The corresponding arguments are `--train_lora`, `--train_adapter`, `--use_qlora`, `--use_qadapter`.
 
-Using ```Bottleneck Adapter```
-
-There are two parts in Bottleneck Adapter: mh_adapter, output_adapter.
-
-Make ```reduction_factor``` larger if you want to reduce the number of adapter parameter. 
+training adapter script: `~/scripts/train_glue/train_adapter.sh`
 
 ## Instruction dataset and Alpaca
 
-Data: `~/in-context-learning/chain-of-thought-finetuning/data/alpaca_data`
-
-Link: https://github.com/HazyResearch/skill-it/tree/main/aux_data 
-
-Package: Pytorch Nightly; Pytorch Lightning
-
-```
-conda env create -f environment.yml
-```
+Data link: https://github.com/HazyResearch/skill-it/tree/main/aux_data 
 
 #### Step 1
 
@@ -150,10 +138,10 @@ file_dir = os.path.join("./results/", save_name)
 If you find this repository useful or happen to use it in a research paper, please cite our work with the following bib information
 
 ```
-@article{Li2024efficient,
+@article{Li2025efficient,
   title={Efficient Ensemble for Fine-tuning Language Models on Multiple Datasets},
   author={Li, Dongyue and Zhang, Ziniu and Wang, Lu and Zhang, Hongyang R},
-  booktitle={Proceedings of the 63nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)},
+  booktitle={Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)},
   year={2025},
 }
 ```
