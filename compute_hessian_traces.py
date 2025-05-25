@@ -272,27 +272,6 @@ if __name__ == "__main__":
             minimum_samples_validation=args.minimum_samples_validation)
     data_module.setup(stage="fit")
 
-    # task_answer_choices = {}
-    # for task_name in args.task_names:
-    #     answer_choices = data_module.task_to_templates[task_name].answer_choices.split("|||")
-    #     # process the answer choices, different models tokenize them differently
-    #     if "gpt" in args.model_key: 
-    #         answer_choices = [" " + choice.strip() for choice in answer_choices] 
-    #         answer_choices = [tokenizer([choice])["input_ids"][0][0] for choice in answer_choices]; answer_choices.sort()
-    #     elif "TinyLlama" in args.model_key or ("CodeLlama" in args.model_key):
-    #         answer_choices = [choice.strip() for choice in answer_choices]
-    #         answer_choices = [tokenizer([choice])["input_ids"][0][1] for choice in answer_choices]; answer_choices.sort()
-    #     elif "Llama-3" in args.model_key:
-    #         answer_choices = [" " + choice.strip() for choice in answer_choices] 
-    #         answer_choices = [tokenizer([choice])["input_ids"][0][1] for choice in answer_choices]; answer_choices.sort()
-    #     else:
-    #         answer_choices = [" " + choice.strip() for choice in answer_choices] 
-    #         answer_choices = [tokenizer([choice])["input_ids"][0][0] for choice in answer_choices]; answer_choices.sort()
-    #     task_answer_choices[task_name] = answer_choices
-    # lm = GLUEMultitaskModel(model, tokenizer, model_type, use_cpu_offload=False,
-    #                 lr=args.lr, weight_decay=args.weight_decay, max_length=args.max_length, use_wandb=args.use_wandb, 
-    #                 optimizer=args.optimizer, generate_output=args.generate_output, task_names=args.task_names, task_answer_choices=task_answer_choices)
-    
     # load checkpoint
     load_model_dir = args.load_model_dir
     if load_model_dir is not None:

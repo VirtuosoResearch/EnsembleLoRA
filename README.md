@@ -1,4 +1,37 @@
-# Quantized Fine-tuning
+# Efficient Ensemble for Fine-tuning Language Models on Multiple Datasets
+- Authors: [Dongyue Li](https://lidongyue12138.github.io/), [Ziniu Zhang](https://ziniuzhang.github.io/), [Lu Wang](https://web.eecs.umich.edu/~wangluxy/) and [Hongyang R. Zhang](https://www.hongyangzhang.com/)
+- Paper: [arXiv]()
+
+![pipeline](./pipeline.png)
+
+## Overview
+
+This code implements  an ensemble method of low-rank adapters for adapting language models across multiple datasets. First, we develop an efficient task affinity grouping algorithm, with a first-order approximation for estimating task affinities and a clustering step to partition tasks into groups. Then, we construct an ensemble for groups of tasks, consisting of adapters fine-tuned on each group with additional boosting steps.
+
+## Requirements
+
+To build up the environment, please run the following commands.
+
+```bash
+conda create -n ensemble python=3.10
+conda activate ensemble
+
+pip install -r ./requirement.txt 
+pip3 install torch torchvision torchaudio # check the pytorch version
+
+mkdir ./results
+mkdir ./external_lightning_logs
+python setup.py develop
+
+git clone https://github.com/bigscience-workshop/promptsource.git
+cd promptsource/
+pip install -e .
+cd ../
+
+pip install lightning==2.2.5
+pip install pytorch-lightning==2.2.5
+
+```
 
 ## Usage of Adapter
 
@@ -109,4 +142,18 @@ save_name = "Alpaca_{}".format(model_key) + \
             (f"_{args.save_name}" if args.save_name else "") + \
             f"_dim_{args.project_dimension}_run_{args.run}" 
 file_dir = os.path.join("./results/", save_name)
+```
+
+
+
+## Reference
+If you find this repository useful or happen to use it in a research paper, please cite our work with the following bib information
+
+```
+@article{Li2024efficient,
+  title={Efficient Ensemble for Fine-tuning Language Models on Multiple Datasets},
+  author={Li, Dongyue and Zhang, Ziniu and Wang, Lu and Zhang, Hongyang R},
+  booktitle={Proceedings of the 63nd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)},
+  year={2025},
+}
 ```
