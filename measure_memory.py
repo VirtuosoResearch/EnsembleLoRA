@@ -5,7 +5,8 @@ import wandb
 
 from src.custom.glue_multitask_data_module import GLUEMultitaskDataModule
 from src.custom.glue_multitask_model import GLUEMultitaskModel
-# from src.lqlora_utils import lora_utils
+from src.merging_utils import merging_strategies
+from src.merging_utils.ensemble import EnsembleModule, MaxModelPredictor, EnsembleAdapterModule, EnsembleLoRAModule
 
 from functools import partial
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, lambda_auto_wrap_policy, transformer_auto_wrap_policy, _or_policy
@@ -24,27 +25,51 @@ from torch.nn import Embedding
 
 from peft import get_peft_model, LoraConfig
 from pytorch_lightning.callbacks import ModelCheckpoint
-from pytorch_lightning.strategies import SingleDeviceStrategy
 import pandas as pd
 from collections import defaultdict
 import time
 
 from torch._inductor.async_compile import AsyncCompile
+from adapters import AutoAdapterModel,list_adapters, BnConfig
+from adapters import SeqBnInvConfig, PrefixTuningConfig, BnConfig, DoubleSeqBnConfig, SeqBnConfig
 
 logging.basicConfig(level=logging.INFO, force=True)
 torch.set_float32_matmul_precision("high")
 
-def get_trainable_parameters(model, removing_keys = ["shared", "lm_head", "wte", "wpe", "ln", "layer_norm", "embed_tokens", "norm"]):
-    params = []
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if any([key in name for key in removing_keys]):
-            continue
-        params.append(param)
-    return params
+from pynvml import *
+
+def print_gpu_utilization():
+    nvmlInit()
+    handle = nvmlDeviceGetHandleByIndex(0)
+    info = nvmlDeviceGetMemoryInfo(handle)
+    # print(info.used, info.total)
+    print(f"GPU 0 memory occupied: {info.used//1024**2} MB.")
+
+    handle = nvmlDeviceGetHandleByIndex(1)
+    info = nvmlDeviceGetMemoryInfo(handle)
+    # print(info.used, info.total)
+    print(f"GPU 1 memory occupied: {info.used//1024**2} MB.")
+
+    handle = nvmlDeviceGetHandleByIndex(2)
+    info = nvmlDeviceGetMemoryInfo(handle)
+    # print(info.used, info.total)
+    print(f"GPU 2 memory occupied: {info.used//1024**2} MB.")
+
+def add_result_to_csv(result_datapoint, file_name):
+    for key, val in result_datapoint.items():
+        result_datapoint[key] = [val, ]
+    
+    if os.path.exists(file_name):
+        result_df = pd.read_csv(file_name, index_col=0)
+        tmp_df = pd.DataFrame(result_datapoint)
+        result_df = pd.concat([result_df, tmp_df], ignore_index = True)
+        result_df.to_csv(file_name)
+    else:
+        result_df = pd.DataFrame(result_datapoint)  
+        result_df.to_csv(file_name)   
 
 def initialize_model(args):
+    model_key = args.model_key.replace("/", "-").replace("..", "")
     if "gpt" in args.model_key or "Llama" in model_key \
         or "bloomz" in model_key or "gemma" in model_key or "Mistral" in model_key:
         hf_key = args.model_key.replace("_", "-")
@@ -71,7 +96,50 @@ def initialize_model(args):
     else:
         raise NotImplementedError(args.model_key)
     
+    if args.train_adapter:
+        
+        if args.use_qadapter:
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type='nf4' 
+            )
+
+            model = AutoAdapterModel.from_pretrained(
+                hf_key, 
+                quantization_config=quantization_config, 
+                torch_dtype=torch.bfloat16, 
+                device_map={"": args.devices[0]}
+            )
+        
+        else: model = AutoAdapterModel.from_pretrained(hf_key)
+
+        bottleneck_config = DoubleSeqBnConfig(
+            mh_adapter=True,    
+            output_adapter=True,    
+            reduction_factor=args.reduction_factor,     
+            non_linearity="relu"     
+        )
+
+        model.add_adapter(adapter_name="seq_bn",config=bottleneck_config)
+        model.adapter_to("seq_bn", f"cuda:{args.devices[0]}", torch.bfloat16)
+        model.heads.default[0].weight.data = model.heads.default[0].weight.data.to(torch.bfloat16)
+
+        for name, param in model.named_parameters():
+            if "adapter" not in name:
+                param.requires_grad = False
+
+        model.set_active_adapters("seq_bn")
+        trainable_params_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        all_params_count = sum(p.numel() for p in model.parameters())
+
+        print(f"Trainable parameters: {trainable_params_count} || All parameters: {all_params_count} || ratio: {trainable_params_count/all_params_count}")
+        print("-"*20,"Bottleneck_Adapter","-"*20)
+
+    
     if args.use_3bit or args.use_2bit:
+        from src.lqlora_utils import lora_utils
         model = lora_utils.prepare_model_for_lora(
             model=model,
             num_ranks=args.lora_rank,
@@ -126,7 +194,35 @@ def initialize_model(args):
         model = get_peft_model(model, config)
         model.print_trainable_parameters()
 
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     return model, tokenizer, hf_key, model_type, append_eos
+
+
+"""
+this file is to figure out problems when using recent llama adapters.
+
+So we need to update the raw codes in `Adapter` package:
+
+1. write 
+```python
+from adapters.models.llama.adapter_model import LlamaAdapterModel
+```
+
+2. click in `LlamaAdapterModel`
+
+3. `LlamaAdapterModel` is inherit from 3 father classes. click in `ModelWithFlexibleHeadsAdaptersMixin`
+
+4. find a function called `_load_pretrained_model` in this class.
+
+5. add following codes after the defenition of `head_config`
+```python
+        if head_config is None and "Llama" in model.model.__repr__():
+            head_config = {'head_type': 'causal_lm'}
+```
+
+"""
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -138,20 +234,16 @@ if __name__ == "__main__":
     parser.add_argument("--accumulate", type=int, default=1)
     parser.add_argument("--strategy", type=str, default="auto")
     parser.add_argument("--precision", type=str, default="32")
+    parser.add_argument("--max_length", type=int, default=512)
+
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0)
     parser.add_argument("--disable_checkpointing", action="store_true")
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--max_length", type=int, default=256)
-    parser.add_argument("--task_idxes", type=int, nargs="+", default=None)
+    parser.add_argument("--epochs", type=int, default=0)
     parser.add_argument("--save_every_epoch", action="store_true")
-    parser.add_argument("--val_split_ratio", type=float, default=0.1)
-    parser.add_argument("--downsample_ratio", type=float, default=0.5)
-    parser.add_argument("--minimum_samples", type=int, default=500)
-    parser.add_argument("--minimum_samples_validation", type=int, default=200)
-
-
+    parser.add_argument("--downsample", type=int, default=None)
     parser.add_argument("--optimizer", type=str, default="adamw")
+
     parser.add_argument("--use_qlora", action="store_true")
     parser.add_argument("--use_3bit", action="store_true")
     parser.add_argument("--use_2bit", action="store_true")
@@ -159,20 +251,20 @@ if __name__ == "__main__":
     parser.add_argument("--train_lora", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=4)
     parser.add_argument("--lora_alpha", type=int, default=32)
-    
+
+    parser.add_argument("--num_ensembled_models", type=int, default=1)
+    parser.add_argument("--merge_strategy", type=str, default="simple_ensemble")
+
+    parser.add_argument("--train_adapter", action="store_true")
+    parser.add_argument("--use_qadapter", action="store_true")
+    parser.add_argument("--reduction_factor", type=int, default=128)
+
+    # not in use
     parser.add_argument("--save_name", type=str, default=None)
-    parser.add_argument("--runs", type=int, default=3)
-
-    parser.add_argument("--load_model_dir", type=str, default="test")
-    parser.add_argument("--generate_output", action="store_true")
+    parser.add_argument("--runs", type=int, default=1)
+    parser.add_argument("--write_results", action="store_true")
     parser.add_argument("--use_wandb", action="store_true")
-
-
-    # compute gradient arguments
-    parser.add_argument("--start_step", type=int, default=0)
-    parser.add_argument("--compute_gradient_steps", type=int, default=1e7)
-    parser.add_argument("--compute_gradients_seeds", type=int, nargs="+", default=[0])
-    parser.add_argument("--project_gradients_dim", type=int, default=200)
+    parser.add_argument("--generate_output", action="store_true")
 
     args = parser.parse_args()
     args.enable_checkpointing = not args.disable_checkpointing
@@ -180,33 +272,37 @@ if __name__ == "__main__":
     print(args)
     print("-" * 80)
 
-    ''' Constants '''
     model_key = args.model_key.replace("/", "-").replace("..", "")
-    load_model_dir = args.load_model_dir
-    save_name = (f"{args.save_name}_{model_key}" if args.save_name else "") + \
+    save_name = (f"_{args.save_name}" if args.save_name else "") + \
                 (f"_lora_r_{args.lora_rank}" if args.train_lora else "") 
-    seed_str = "_".join([str(seed) for seed in args.compute_gradients_seeds])
-    gradients_dir = save_name + f"_dim_{args.project_gradients_dim}_seed_{seed_str}" # + ("_pretrained" if not os.path.exists(load_model_dir) else "")
     file_dir = os.path.join("./results/", save_name)
     if not os.path.exists(file_dir):
         os.mkdir(file_dir)
-    
-    if not os.path.exists("external_lightning_logs"):
-            raise Exception("external_lightning_logs/ does not exist")
-    default_root_dir = os.path.join("external_lightning_logs", 
-                                    f"{model_key}_" + \
-                                    "_".join(args.task_names) + \
-                                    (f"_lora_r_{args.lora_rank}" if args.train_lora else "") + \
-                                    (f"_{args.save_name}" if args.save_name else "")
-                                    )
-    ''' Constants '''
 
-    metrics = {}
-    model, tokenizer, hf_key, model_type, append_eos = initialize_model(args)
-
-    if os.path.exists(load_model_dir):
-        returned_keys = model.load_state_dict(torch.load(load_model_dir, map_location="cpu"), strict=False)
-        print(f"Loaded from {load_model_dir}: {returned_keys}")
+    if args.merge_strategy == "simple_ensemble":
+        models = []
+        for idx in range(args.num_ensembled_models):
+            model, tokenizer, hf_key, model_type, append_eos = initialize_model(args)
+            model, _, _, _, _ = initialize_model(args)
+            models.append(model)
+        model = EnsembleModule(models) if "simple" in args.merge_strategy else MaxModelPredictor(models)
+    elif args.merge_strategy == "adapter_ensemble":
+        if args.train_lora: 
+            model, tokenizer, hf_key, model_type, append_eos = initialize_model(args)
+            load_model_dir = os.path.join("external_lightning_logs",
+                                        "llama3.2_1B_cb_lora_r_16_boost_4bit_run_0/epoch_epoch=7.pt")
+            model = EnsembleLoRAModule(model, [load_model_dir], [0.1])
+            for idx in range(args.num_ensembled_models-1):
+                model.add_adapter(load_model_dir, 0.1) 
+            print(f"Loaded model with {len(model.adapter_list)} ensemble")
+        elif args.train_adapter:
+            model, tokenizer, hf_key, model_type, append_eos = initialize_model(args)
+            load_model_dir = os.path.join("external_lightning_logs",
+                                        "llama3.2_1B_cb_lora_r_16_boost_4bit_run_0/epoch_epoch=7.pt")
+            model = EnsembleAdapterModule(model, [load_model_dir], [0.1])
+            for idx in range(args.num_ensembled_models-1):
+                model.add_adapter(load_model_dir, 0.1) 
+            print(f"Loaded model with {len(model.adapter_list)} ensemble")
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -222,10 +318,7 @@ if __name__ == "__main__":
             tokenizer=tokenizer,
             batch_size=batch_size,
             inference_batch_size=inference_batch_size,
-            max_input_length=args.max_length,
-            downsample_ratio=args.downsample_ratio,
-            minimum_samples=args.minimum_samples,
-            minimum_samples_validation=args.minimum_samples_validation)
+            max_input_length=args.max_length)
     data_module.setup(stage="fit")
 
     task_answer_choices = {}
@@ -235,11 +328,11 @@ if __name__ == "__main__":
         if "gpt" in args.model_key: 
             answer_choices = [" " + choice.strip() for choice in answer_choices] 
             answer_choices = [tokenizer([choice])["input_ids"][0][0] for choice in answer_choices]; answer_choices.sort()
-        elif "TinyLlama" in args.model_key or ("CodeLlama" in args.model_key):
-            answer_choices = [choice.strip() for choice in answer_choices]
-            answer_choices = [tokenizer([choice])["input_ids"][0][1] for choice in answer_choices]; answer_choices.sort()
         elif "Llama-3" in args.model_key:
             answer_choices = [" " + choice.strip() for choice in answer_choices] 
+            answer_choices = [tokenizer([choice])["input_ids"][0][1] for choice in answer_choices]; answer_choices.sort()
+        elif "TinyLlama" in args.model_key:
+            answer_choices = [choice.strip() for choice in answer_choices]
             answer_choices = [tokenizer([choice])["input_ids"][0][1] for choice in answer_choices]; answer_choices.sort()
         else:
             answer_choices = [" " + choice.strip() for choice in answer_choices] 
@@ -247,10 +340,19 @@ if __name__ == "__main__":
         task_answer_choices[task_name] = answer_choices
     lm = GLUEMultitaskModel(model, tokenizer, model_type, use_cpu_offload=False,
                     lr=args.lr, weight_decay=args.weight_decay, max_length=args.max_length, use_wandb=args.use_wandb, 
-                    optimizer=args.optimizer, generate_output=args.generate_output, task_names=args.task_names, task_answer_choices=task_answer_choices,
-                    compute_gradients=True, gradients_dir=gradients_dir,
-                    project_gradients_dim=args.project_gradients_dim, compute_gradients_seeds=args.compute_gradients_seeds, 
-                    compute_gradients_steps=args.compute_gradient_steps, start_step=args.start_step)
+                    optimizer=args.optimizer, generate_output=args.generate_output, task_names=args.task_names, task_answer_choices=task_answer_choices)
+
+    if not os.path.exists("external_lightning_logs"):
+        raise Exception("external_lightning_logs/ does not exist")
+    default_root_dir = os.path.join("external_lightning_logs", 
+                                    (f"merging_by_{args.merge_strategy}") + \
+                                    "_".join(args.task_names) + \
+                                    (f"_lora_r_{args.lora_rank}" if args.train_lora else "") + \
+                                    (f"_{args.save_name}" if args.save_name else "")
+                                    )
+    # remove previous checkpoints
+    if os.path.exists(default_root_dir):
+        os.system(f"rm -rf {default_root_dir}")
     
     checkpoint_callback = ModelCheckpoint(
         monitor="accuracy_score",
@@ -259,22 +361,20 @@ if __name__ == "__main__":
         save_top_k=(-1 if args.save_every_epoch else 1),
         mode="max",
     )
+
     trainer = pl.Trainer(accelerator="gpu", devices=args.devices, strategy=args.strategy,
                         default_root_dir=default_root_dir, min_epochs=args.epochs, max_epochs=args.epochs,
                         accumulate_grad_batches=args.accumulate, precision=args.precision,
                         enable_checkpointing=args.enable_checkpointing,
-                        callbacks=[checkpoint_callback], use_distributed_sampler=False, inference_mode=False
+                        callbacks=[checkpoint_callback]
                         )
-    # save initial weights
-    if args.train_lora:
-        if not os.path.exists(os.path.join("gradients", gradients_dir)):
-            os.makedirs(os.path.join("gradients", gradients_dir))
-        model_path = os.path.join("gradients", gradients_dir) + "/initial_weights.pt"
-        state_dict = model.state_dict()
-        state_dict = {k: v.clone() for k, v in state_dict.items() if "lora" in k}
-        torch.save(state_dict, model_path)
-    
+
+    # evaluate the best checkpoint
     start_time = time.time()
-    outputs = trainer.predict(lm, dataloaders=data_module.train_dataloader())
+    if args.use_3bit or args.use_2bit:
+        trainer.validate_loop.trainer_fn = TrainerFn.FITTING
+        trainer.validate_loop.inference_mode = False
+    summary = trainer.validate(lm, datamodule=data_module)[0]
+    logging.info(summary)
     end_time = time.time()
-    print("Time for computing gradients & outputs", end_time - start_time)
+    print(f"Evaluation time: {end_time - start_time}")

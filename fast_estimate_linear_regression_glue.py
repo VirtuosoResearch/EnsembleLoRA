@@ -187,9 +187,10 @@ if __name__ == "__main__":
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--task_idxes", type=int, nargs="+", default=None)
     parser.add_argument("--save_every_epoch", action="store_true")
-    parser.add_argument("--downsample_ratio", type=float, default=1.0)
-    parser.add_argument("--minimum_samples", type=int, default=1e6)
-    parser.add_argument("--minimum_samples_validation", type=int, default=1e6)
+    parser.add_argument("--val_split_ratio", type=float, default=0.1)
+    parser.add_argument("--downsample_ratio", type=float, default=0.5)
+    parser.add_argument("--minimum_samples", type=int, default=500)
+    parser.add_argument("--minimum_samples_validation", type=int, default=200)
 
     parser.add_argument("--optimizer", type=str, default="adamw")
     parser.add_argument("--use_qlora", action="store_true")
@@ -613,9 +614,6 @@ if __name__ == "__main__":
                             result_datapoint[tmp_key] = val
                     file_name = os.path.join(file_dir, "results.csv")
                     add_result_to_csv(result_datapoint, file_name)
-        # task_idxes = [0]
-        # assert args.num_repeat == len(args.compute_gradients_seeds)
-        # summary = gradient_based_estimation(task_idxes, repeat=args.num_repeat, seeds=args.compute_gradients_seeds)
     else:
         sampled_task_dir = os.path.join("./sampled_indices", "{}.txt".format(sampled_task_dir)); task_num = len(args.task_names)
         if not os.path.exists(sampled_task_dir):
@@ -634,7 +632,7 @@ if __name__ == "__main__":
             tmp_sampled_tasks = " ".join([str(idx) for idx in task_idxes])
             if tmp_sampled_tasks in sampled_tasks:
                 continue
-            summary = gradient_based_estimation(task_idxes)
+            summary = gradient_based_estimation(task_idxes, repeat=args.num_repeat, seeds=args.compute_gradients_seeds)
             if not summary:
                 continue
 

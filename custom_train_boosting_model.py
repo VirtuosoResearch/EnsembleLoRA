@@ -211,12 +211,48 @@ def aggregate_metrics(outputs, task_names):
     print(summary)
     return summary
 
+''' Linear Approximation: linear regression '''
+def generate_state_dict(model, state_dict, coef, device="cpu", removing_keys = ["shared", "lm_head", "wte", "wpe", "ln", "embed_tokens", "norm", "word_embeddings"]):
+    new_state_dict = {}; cur_len = 0
+    for key, param in model.named_parameters():
+        if not param.requires_grad: continue
+        param_len = param.numel()
+        if any([rkey in key for rkey in removing_keys]):
+            continue
+            # new_state_dict[key] = state_dict[key].clone()
+        else:
+            assert "lora" in key
+            new_state_dict[key] = state_dict[key].clone().to(device) + \
+                torch.FloatTensor(coef[cur_len:cur_len+param_len].reshape(param.shape)).to(device)
+            cur_len += param_len
+    return new_state_dict
+
+def solve_linear_regression(lm, state_dict, gradients, outputs, residuals, scale=None):
+    from sklearn.linear_model import LinearRegression, Ridge
+
+    y = - (residuals + outputs)
+    reg = Ridge().fit(gradients, y)
+
+    coef = reg.coef_
+    project_matrix = lm.project_matrix
+    coef = project_matrix @ coef.flatten()
+    print("L2 norm before scaling", np.linalg.norm(coef))
+    if scale is not None:
+        coef = coef*scale / np.linalg.norm(coef)
+    print("L2 norm after scaling", np.linalg.norm(coef))
+
+    # evaluate task performances
+    new_state_dict = generate_state_dict(lm.model, state_dict, coef, device=lm.model.device)
+    return new_state_dict
+
 
 def main(args):
     # Initialize the model
     model_key = args.model_key.replace("/", "-").replace("..", "")
     save_name = (f"_{args.save_name}" if args.save_name else "") + \
                 (f"_lora_r_{args.lora_rank}" if args.train_lora else "")         
+    gradients_dir = save_name + f"_dim_{args.project_gradients_dim}_seed_{args.compute_gradients_seeds[0]}"
+
     model, tokenizer, hf_key, model_type, append_eos = initialize_model(args)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -266,7 +302,9 @@ def main(args):
 
     lm = GLUEMultitaskModel(model, tokenizer, model_type, use_cpu_offload=False,
                     lr=args.lr, weight_decay=args.weight_decay, max_length=args.max_length, use_wandb=args.use_wandb, 
-                    optimizer=args.optimizer, generate_output=args.generate_output, task_names=args.task_names, task_answer_choices=task_answer_choices)
+                    optimizer=args.optimizer, generate_output=args.generate_output, task_names=args.task_names, task_answer_choices=task_answer_choices,
+                    compute_gradients=True, gradients_dir=gradients_dir, 
+                    project_gradients_dim=args.project_gradients_dim, compute_gradients_seeds=args.compute_gradients_seeds)
 
     if not os.path.exists("external_lightning_logs"):
         raise Exception("external_lightning_logs/ does not exist")
@@ -292,6 +330,10 @@ def main(args):
                         enable_checkpointing=True,
                         callbacks=[checkpoint_callback]
                         )
+    
+    # Before estimation
+    tasks_to_lengths = [len(task_list) for task_list in data_module.multitask_train_sampler._train_data_list]
+    tasks_to_indices = [list(range(sum(tasks_to_lengths[:i]), sum(tasks_to_lengths[:i+1]))) for i, task_name in enumerate(args.task_names)]
 
     ''' In-place save '''
     from lightning_fabric.utilities.cloud_io import _load as pl_load
@@ -336,27 +378,44 @@ def main(args):
             lm.lr = 5e-4
             lm.fit_least_square = True
             model.load_state_dict(initial_lora_state_dict, strict=False) # re-initialize the adapter weights
-            checkpoint_callback = ModelCheckpoint(
-                monitor="loss",
-                dirpath=default_root_dir,
-                filename="epoch_{epoch}",
-                save_top_k=(-1 if args.save_every_epoch else 1),
-                mode="min",
-            ) # initialize a new checkpoint callback
-            trainer = pl.Trainer(accelerator="gpu", devices=args.devices, strategy=args.strategy,
-                            default_root_dir=default_root_dir, min_epochs=args.epochs, max_epochs=args.epochs,
-                            accumulate_grad_batches=args.accumulate, precision=args.precision,
-                            enable_checkpointing=True,
-                            callbacks=[checkpoint_callback]
-                            )
-            trainer.fit(lm, data_module)
+            if args.fit_linear_regression:
+                # Load gradients 
+                gradient_idxes = []
+                for task_idx in args.task_idxes:
+                    gradient_idxes += tasks_to_indices[task_idx]
 
-            # Save the trained model and write an ensemble to evaluate the predictions
-            task_names_str = "_".join(args.task_names)
-            appendix = f"_gradient_boosting_{task_names_str}_iteration_{est_idx}"
-            checkpoint_dir = checkpoint_callback.best_model_path.replace(".ckpt", "") + appendix + ".pt"
-            save_trained_model(checkpoint_callback.best_model_path, appendix)
-            os.remove(checkpoint_callback.best_model_path)
+                gradients = []; outputs = []
+                for idx in gradient_idxes:
+                    if os.path.exists(f"./gradients/{gradients_dir}/train_batch_{idx}_gradients.npy"):
+                        gradients.append(np.load(f"./gradients/{gradients_dir}/train_batch_{idx}_gradients.npy"))
+                        outputs.append(np.load(f"./gradients/{gradients_dir}/train_batch_{idx}_outputs.npy")[:, 0])
+                gradients = np.concatenate(gradients, axis=0)
+                pretrained_outputs = np.concatenate(outputs, axis=0)
+                new_state_dict = solve_linear_regression(lm, initial_lora_state_dict, gradients, pretrained_outputs, residuals)
+                checkpoint_dir =  os.path.join(default_root_dir, "epoch_0" + f"_gradient_boosting_{task_names_str}_iteration_{est_idx}" + ".pt")
+                torch.save(new_state_dict, checkpoint_dir)
+            else:
+                checkpoint_callback = ModelCheckpoint(
+                    monitor="loss",
+                    dirpath=default_root_dir,
+                    filename="epoch_{epoch}",
+                    save_top_k=(-1 if args.save_every_epoch else 1),
+                    mode="min",
+                ) # initialize a new checkpoint callback
+                trainer = pl.Trainer(accelerator="gpu", devices=args.devices, strategy=args.strategy,
+                                default_root_dir=default_root_dir, min_epochs=args.epochs, max_epochs=args.epochs,
+                                accumulate_grad_batches=args.accumulate, precision=args.precision,
+                                enable_checkpointing=True,
+                                callbacks=[checkpoint_callback]
+                                )
+                trainer.fit(lm, data_module)
+
+                # Save the trained model and write an ensemble to evaluate the predictions
+                task_names_str = "_".join(args.task_names)
+                appendix = f"_gradient_boosting_{task_names_str}_iteration_{est_idx}"
+                checkpoint_dir = checkpoint_callback.best_model_path.replace(".ckpt", "") + appendix + ".pt"
+                save_trained_model(checkpoint_callback.best_model_path, appendix)
+                os.remove(checkpoint_callback.best_model_path)
 
             _ensemble_model.add_adapter(checkpoint_dir, gradient_boosting_lr)
             trainer.validate(ensemble_model, dataloaders=data_module.val_dataloader())
@@ -436,6 +495,11 @@ if __name__ == "__main__":
     parser.add_argument("--train_adaboosting", action="store_true")
     parser.add_argument("--n_estimators", type=int, default=10)
     parser.add_argument("--gradient_boosting_lr", type=float, default=0.2)
+    parser.add_argument("--fit_linear_regression", action="store_true")
+    parser.add_argument("--compute_gradients_seeds", type=int, nargs="+", default=[0])
+    parser.add_argument("--project_gradients_dim", type=int, default=200)
+    parser.add_argument("--scale", type=float, default=0.1)
+    parser.add_argument("--task_idxes", type=int, nargs="+", default=None)
     args = parser.parse_args()
 
     main(args)

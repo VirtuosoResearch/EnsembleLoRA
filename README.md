@@ -1,12 +1,12 @@
 # Efficient Ensemble for Fine-tuning Language Models on Multiple Datasets
 - Authors: [Dongyue Li](https://lidongyue12138.github.io/), [Ziniu Zhang](https://ziniuzhang.github.io/), [Lu Wang](https://web.eecs.umich.edu/~wangluxy/) and [Hongyang R. Zhang](https://www.hongyangzhang.com/)
-- Paper: [arXiv]()
+- Paper: [arXiv](https://arxiv.org/abs/2505.21930)
 
 ![pipeline](./pipeline.png)
 
 ## Overview
 
-This code implements  an ensemble method of low-rank adapters for adapting language models across multiple datasets. First, we develop an efficient task affinity grouping algorithm, with a first-order approximation for estimating task affinities and a clustering step to partition tasks into groups. Then, we construct an ensemble for groups of tasks, consisting of adapters fine-tuned on each group with additional boosting steps.
+This code implements an ensemble method of low-rank adapters for adapting language models across multiple datasets. First, we develop an efficient task affinity grouping algorithm, with a first-order approximation for estimating task affinities and a clustering step to partition tasks into groups. Then, we construct an ensemble for groups of tasks, consisting of adapters fine-tuned on each group with additional boosting steps.
 
 ## Requirements
 
@@ -33,106 +33,62 @@ pip install pytorch-lightning==2.2.5
 
 ```
 
-## Usage of Adapter
+## Usage
 
-We have implemented `LoRA`, `Bottleneck Adapter`, `QLoRA`, `Quantized Bottleneck Adapter`. The corresponding arguments are `--train_lora`, `--train_adapter`, `--use_qlora`, `--use_qadapter`.
+We have implemented `LoRA`, `Bottleneck Adapter`, `QLoRA`, and `Quantized Bottleneck Adapter`. The corresponding arguments are `--train_lora`, `--train_adapter`, `--use_qlora`, `--use_qadapter`.
 
-training adapter script: `~/scripts/train_glue/train_adapter.sh`
+We provide a training script in `scripts/train.sh` as an example of fine-tuning a single adapter on the combination of all tasks.
 
-## Instruction dataset and Alpaca
+### Stage 1: Task affinity grouping for LM fine-tuning
 
-Data link: https://github.com/HazyResearch/skill-it/tree/main/aux_data 
+First, we evaluate and project gradients on the pretrained model of all training examples. Use the script `fast_estimate_compute_gradients_glue.py`. We provide an example to use the script in `scripts/eval_gradients.sh`. 
 
-#### Step 1
+- `--compute_gradient_seeds` indicates the seed for generating a random projection matrix. This makes sure that we initialize the same projection matrix every time. 
+- `--project_gradients_dim` indicates the projection dimension
 
-Train a model on all data: `./scripts/alpaca/train_alpaca.sh`
+This will create a folder under `gradients`, saving the initial adapter parameters and the projected gradients. 
 
-Use `custom_train_alpaca.py`
-```
-python custom_train_alpaca.py --model_key $model_key\
-    --lr 5e-5 --batch_size 1 --max_length 256 --epochs 10\
-    --train_lora --lora_rank 4 --lora_alpha 32\
-    --strategy auto --devices 0 1 2 --runs 1 --accumulate 1 --precision "bf16-true" 
-```
-Main parameters: 
-- `model_key`: huggingface directories: `../llama/llama-3/Meta-Llama-3-8B-hf`, `google/gemma-2b`, `TinyLlama/TinyLlama-1.1B-intermediate-step-1431k-3T`, `flan_t5_base`, ...
-- `save_name`: name for saving the checkpoints
-- `load_model_dir`: the name of the directory of the checkpoint to be loaded
-- `write_results`: write the loss results to a csv file
+Then, we will use the gradients as features to solve logistic regression. Use the script `fast_estimate_linear_regression_glue.py`. We provide an example to use the script in `scripts/solve_logistic_regression.sh`.
 
-#### Step 2
+- `--number_of_subsets` controls the number of subsets of tasks to sample
+- `--subset_size` controls the size of the subsets
+- `--regularization_lambda` indicates the regularization strength when using the logistic regression. The range is usually between $1e-3$ and $1e-2$. 
 
-Compute and project gradients on all training samples: `./script/alpaca/eval_approximation_err.sh`
+This will generate a CSV file in the `results` folder, which saves all the evaluation results of the estimation. 
 
-Run `fast_estimate_eval_approximation_alpaca.py` 
-```
-python fast_estimate_eval_approximation_alpaca.py \
-    --model_key $model_key --train_lora --lora_rank 4 --lora_alpha 32 --precision "bf16-true"\
-    --batch_size 2 --max_length 256 --project_gradients --project_dimension 100 \
-    --devices 0 1 2 --strategy auto --save_name $save_name --compute_pretrained_outputs
-```
-- Main parameters: 
-  - `--compute_pretrained_outputs` will compute the gradients and outputs at the initialization
-  - `--model_key`
-  - `--save_name`
-  - `--downsample`: downsampling the dataset
-  - `--num_batches_gradients`: number of batches to compute gradients. `num_batches_gradients` * `batch_size` = `downsample`
+Finally, we apply a clustering algorithm to generate a partition of tasks. We provide an example in `clustering.py` to run examples of our clustering algorithms. 
 
-Note: Before `load_model_dir`, use `export_hf_model` to save models as huggingface model checkpoints. 
+### Stage 2: Designing an ensemble of adapters
 
-### Step 3: Compute Linear Approximation Error
+After we generate a partition of tasks, we fine-tune one individual adapter on each cluster of tasks. This also uses the script `custom_train.py`. We show the script to train the adapters on groups in `scripts/train_v2.py`
+
+Then, we apply a gradient boosting procedure on the group with a high training error. We use the script `custom_train_boosting_model.py`. 
+
+Finally, we utilize the `EnsembleLorAModule` or the `EnsembleAdapterModule` to combine the trained adapters on top of a quantized pretrained model, by providing the path to each of the adapter weights. 
+
+We evaluate the memory cost of the ensemble models with  `measure_memory.py`. 
+
+### Example of evaluating first-order approximation errors
+
+Before running this example, please download the dataset for this example from [this link](https://github.com/HazyResearch/skill-it/tree/main/aux_data). We use an instruction dataset for evaluating the approximation errors. 
+
+First, we evaluate and project gradients over all training samples through the script `fast_estimate_eval_approximation_alpaca.py` . Please see the example script in`/scripts/eval_errors.sh`. The important command arguments are as follows: 
+
+- `--compute_pretrained_outputs` indicates computing the gradients at the pretrained initialization
+- `--model_key` indicates the model name from the huggingface website
+- `--save_name` indicates the name of the path to save the projected gradients 
+- `--seed` indicates the seed to generate the projection matrix. 
+
+- `--project_dimension` indicates the projection dimension of the gradients. 
 
 Estimate linear regression models on subsets of clusters: `./script/alpaca/eval_approximation_err.sh`
 
-Use `fast_estimate_eval_approximation_alpaca.py` 
-```
-python fast_estimate_eval_approximation_alpaca.py \
-    --model_key $model_key --train_lora --lora_rank 4 --lora_alpha 32 --precision "bf16-true"\
-    --batch_size 2 --max_length 256 --project_gradients --project_dimension 100\
-    --scale 0.2 --seed $seed --devices 0 1 2 --strategy auto
-```
-Main parameters:
-- `--project_gradients` 
-- `--project_dimension`
-- `--scale`: control the fine-tuned distance
-- `--save_name`
-
-```
-save_name = ("Instruction_{}".format(model_key) if args.train_instruction else "Alpaca_{}".format(model_key)) + \
-                (f"_lora_r_{args.lora_rank}" if args.train_lora else "") + \
-                ("_{}".format(args.save_name) if args.save_name != "none" else "")
-
-gradient_dir = save_name + f"_dim_{args.project_dimension}_run_{args.run}" + ("_pretrained" if args.load_model_dir is None else "")
-```
-
-Gradients and outputs are saved to `./gradients/{gradient_dir}/`
 
 
-### Step 4: Estimate Fine-tune Model Parameters
+Second, we evaluate the first-order approximation errors by using the projected gradients. This is also implemented in the script `fast_estimate_eval_approximation.py` . Please see the example script in`/scripts/eval_errors.sh`. The important command arguments are as follows: 
 
-```
-python fast_estimate_linear_regression_alpaca.py \
-    --model_key $model_key --train_lora --lora_rank 4 --lora_alpha 32 --precision "bf16-true"\
-    --batch_size 16 --project_gradients --project_dimension 200 --devices 2\
-    --load_model_dir $load_dir\
-    --load_sample_task_dir Alpaca_EleutherAI-gpt-neo-125M_lora_r_4 --number_of_subsets 1000 --subset_size 0.5 --save_name $save_name
-```
-
-Main parameters: 
-- `--load_sample_task_dir`: if specified, will load previously sampled subsets
-  - Otherwise, specify `--number_of_subsets` and `--subset_size`
-- `--scale`: controls the norm of the fine-tuned model
-- `--save_name`
-
-```
-save_name = "Alpaca_{}".format(model_key) + \
-            (f"_lora_r_{args.lora_rank}" if args.train_lora else "") + \
-            (f"_{args.save_name}" if args.save_name else "") + \
-            f"_dim_{args.project_dimension}_run_{args.run}" 
-file_dir = os.path.join("./results/", save_name)
-```
-
-
+- `--scale` indicates the relative distance from the pretrained initialization. This should be calculated based on the relative scale to the initialized adapters. 
+- `--save_name` should be the same as the one used for evaluating the gradient
 
 ## Reference
 If you find this repository useful or happen to use it in a research paper, please cite our work with the following bib information
