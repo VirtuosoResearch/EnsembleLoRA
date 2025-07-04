@@ -150,7 +150,8 @@ class GLUEMultitaskDataModule(pl.LightningDataModule):
         downsample_ratio=1.0, # ratio of downsampling
         minimum_samples=100,
         minimum_samples_validation=100,
-        downsample_seed=0
+        downsample_seed=0,
+        mode="train"
     ):
         super().__init__()
 
@@ -168,6 +169,7 @@ class GLUEMultitaskDataModule(pl.LightningDataModule):
         self.downsample_seed = downsample_seed
         self.minimum_sample = minimum_samples
         self.minimum_sample_validation = minimum_samples_validation
+        self.mode = mode
 
         '''
         Add this to pytorch lightning "pytorch_lightning/utilities/data.py" line 282:
@@ -314,6 +316,7 @@ class GLUEMultitaskDataModule(pl.LightningDataModule):
                 # Select datasets
                 train_dataset = full_train_dataset.select(train_indices)
                 eval_dataset = full_train_dataset.select(val_indices)
+                if len(full_train_dataset) < 1000 and self.mode == "eval": eval_dataset = predict_dataset
 
             # Downsample datasets            
             if self.downsample_rate < 1.0:
@@ -407,7 +410,8 @@ class GLUEMultitaskDataModule(pl.LightningDataModule):
 
         cur_len = 0
         for task_name, train_dataset in self.task_to_train_datasets.items():
-            train_dataset = train_dataset.remove_columns("weights")
+            if "weights" in train_dataset.column_names:
+                train_dataset = train_dataset.remove_columns("weights")
             self.task_to_train_datasets[task_name] = train_dataset.add_column("weights", self.weights[cur_len: cur_len+len(train_dataset)])
             cur_len += len(train_dataset)
 
@@ -425,7 +429,8 @@ class GLUEMultitaskDataModule(pl.LightningDataModule):
 
         cur_len = 0
         for task_name, train_dataset in self.task_to_train_datasets.items():
-            train_dataset = train_dataset.remove_columns("residuals")
+            if "residuals" in train_dataset.column_names:
+                train_dataset = train_dataset.remove_columns("residuals")
             self.task_to_train_datasets[task_name] = train_dataset.add_column("residuals", self.residuals[cur_len: cur_len+len(train_dataset)])
             cur_len += len(train_dataset)
 

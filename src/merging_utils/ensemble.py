@@ -36,154 +36,6 @@ def aggregate_tensors(outputs, aggregate_fn) -> Tensor:
     else:
         raise ValueError("Unsupported type for outputs")
 
-class EnsembleAdapterModule(nn.Module):
-    def __init__(self, base_model, adapter_list=[], weights=[], use_bias=False):
-        super().__init__()
-        self.base_model = base_model
-        self.dummy_adapter = nn.ModuleDict()
-        self.adapter_list = nn.ModuleList([])
-        self.use_bias = use_bias
-
-        # store one set of weights for the original base model
-        for name, module in self.base_model.named_modules():
-            if ("adapter_up" in name or "adapter_down" in name) and isinstance(module, nn.Linear):
-                self.dummy_adapter[name.replace(".", "__")] = nn.Linear(module.in_features, module.out_features, bias=self.use_bias)    
-                self.dummy_adapter[name.replace(".", "__")].weight.requires_grad = False
-                if self.use_bias:
-                    self.dummy_adapter[name.replace(".", "__")].bias.requires_grad = False
-        
-        for i, adapter in enumerate(adapter_list):
-            if os.path.exists(adapter):
-                state_dict = torch.load(adapter, map_location=self.base_model.device)
-            else:
-                state_dict = None
-            self.adapter_list.append(nn.ModuleDict())
-            for name, module in self.base_model.named_modules():
-                if ("adapter_up" in name or "adapter_down" in name) and isinstance(module, nn.Linear):
-                    self.adapter_list[i][name.replace(".", "__")] = nn.Linear(module.in_features, module.out_features, bias=self.use_bias)    
-                    if state_dict is not None:
-                        self.adapter_list[i][name.replace(".", "__")].weight = nn.Parameter(state_dict[name + ".weight"].detach().clone().float())   
-                        if self.use_bias:
-                            self.adapter_list[i][name.replace(".", "__")].bias = nn.Parameter(state_dict[name + ".bias"].detach().clone().float()) 
-        self.weights = weights
-
-    def _aggregate_tensors(self, outputs):
-        weights = torch.Tensor(self.weights).to(self.base_model.device)
-        weights = cast(Tensor, weights).view(-1, *([1] * outputs[0].dim()))
-        return (torch.stack(outputs) * weights).sum(dim=0)
-    
-    def add_adapter(self, adapter, weight, state_dict=None):
-        idx = len(self.adapter_list)
-        if state_dict is not None:
-            state_dict = state_dict
-        elif os.path.exists(adapter):
-            state_dict = torch.load(adapter, map_location=self.base_model.device)
-        else:
-            print(f"Adapter {adapter} does not exist! Creating a random initialized adapter")
-            state_dict = None
-        self.adapter_list.append(nn.ModuleDict())
-        for name, module in self.base_model.named_modules():
-            if ("adapter_up" in name or "adapter_down" in name) and isinstance(module, nn.Linear):
-                self.adapter_list[idx][name.replace(".", "__")] = nn.Linear(module.in_features, module.out_features, bias=self.use_bias)
-                if state_dict is not None:    
-                    self.adapter_list[idx][name.replace(".", "__")].weight = nn.Parameter(state_dict[name + ".weight"].detach().clone().float())    
-                    if self.use_bias:
-                            self.adapter_list[i][name.replace(".", "__")].bias = nn.Parameter(state_dict[name + ".bias"].detach().clone().float())
-        self.weights.append(weight)
-
-    def _assign_weights(self, adapter_idx):
-        for name, module in self.base_model.named_modules():
-            if ("adapter_up" in name or "adapter_down" in name) and isinstance(module, nn.Linear):
-                module.weight = self.adapter_list[adapter_idx][name.replace(".", "__")].weight 
-                if self.use_bias:
-                    module.bias = self.adapter_list[adapter_idx][name.replace(".", "__")].bias
-
-    def _revert_weights(self):
-        for name, module in self.base_model.named_modules():
-            if ("adapter_up" in name or "adapter_down" in name) and isinstance(module, nn.Linear):
-                module.weight = self.dummy_adapter[name.replace(".", "__")].weight
-                if self.use_bias:
-                    module.bias = self.dummy_adapter[name.replace(".", "__")].bias
-
-    def forward(self, *args, **kwargs):
-        outputs = []
-        for adapter_idx, adapter in enumerate(self.adapter_list):
-            self._assign_weights(adapter_idx)
-            outputs.append(self.base_model(*args, **kwargs))
-
-        # revert the weights back to the original base model
-        self._revert_weights()
-        return aggregate_tensors(outputs, self._aggregate_tensors)
-
-
-class EnsembleLoRAModule(nn.Module):
-    def __init__(self, base_model, adapter_list=[], weights=[]):
-        super().__init__()
-        self.base_model = base_model
-        self.dummy_adapter = nn.ModuleDict()
-        self.adapter_list = nn.ModuleList([])
-
-        # store one set of weights for the original base model
-        for name, module in self.base_model.named_modules():
-            if "lora" in name and isinstance(module, nn.Linear):
-                self.dummy_adapter[name.replace(".", "__")] = nn.Linear(module.in_features, module.out_features, bias=False)
-                self.dummy_adapter[name.replace(".", "__")].weight.requires_grad = False
-        
-        for i, adapter in enumerate(adapter_list):
-            if os.path.exists(adapter):
-                state_dict = torch.load(adapter, map_location=self.base_model.device)
-            else:
-                state_dict = None
-            self.adapter_list.append(nn.ModuleDict())
-            for name, module in self.base_model.named_modules():
-                if "lora" in name and isinstance(module, nn.Linear):
-                    self.adapter_list[i][name.replace(".", "__")] = nn.Linear(module.in_features, module.out_features, bias=False)    
-                    if state_dict is not None:
-                        self.adapter_list[i][name.replace(".", "__")].weight = nn.Parameter(state_dict[name + ".weight"].detach().clone().float())    
-        self.weights = weights
-
-    def _aggregate_tensors(self, outputs):
-        weights = torch.Tensor(self.weights).to(self.base_model.device)
-        weights = cast(Tensor, weights).view(-1, *([1] * outputs[0].dim()))
-        return (torch.stack(outputs) * weights).sum(dim=0)
-    
-    def add_adapter(self, adapter, weight, state_dict=None):
-        idx = len(self.adapter_list)
-        if state_dict is not None:
-            state_dict = state_dict
-        elif os.path.exists(adapter):
-            state_dict = torch.load(adapter, map_location=self.base_model.device)
-        else:
-            print(f"Adapter {adapter} does not exist! Creating a random initialized adapter")
-            state_dict = None
-        self.adapter_list.append(nn.ModuleDict())
-        for name, module in self.base_model.named_modules():
-            if "lora" in name and isinstance(module, nn.Linear):
-                self.adapter_list[idx][name.replace(".", "__")] = nn.Linear(module.in_features, module.out_features, bias=False)
-                if state_dict is not None:    
-                    self.adapter_list[idx][name.replace(".", "__")].weight = nn.Parameter(state_dict[name + ".weight"].detach().clone().float())    
-        self.weights.append(weight)
-
-    def _assign_weights(self, adapter_idx):
-        for name, module in self.base_model.named_modules():
-            if "lora" in name and isinstance(module, nn.Linear):
-                module.weight = self.adapter_list[adapter_idx][name.replace(".", "__")].weight 
-
-    def _revert_weights(self):
-        for name, module in self.base_model.named_modules():
-            if "lora" in name and isinstance(module, nn.Linear):
-                module.weight = self.dummy_adapter[name.replace(".", "__")].weight
-
-    def forward(self, *args, **kwargs):
-        outputs = []
-        for adapter_idx, adapter in enumerate(self.adapter_list):
-            self._assign_weights(adapter_idx)
-            outputs.append(self.base_model(*args, **kwargs))
-        # revert the weights back to the original base model
-        self._revert_weights()
-        return aggregate_tensors(outputs, self._aggregate_tensors)
-
-
 class EnsembleModule(nn.Module):
     def __init__(self, models: List[nn.Module]):
         super().__init__()
@@ -305,3 +157,170 @@ class LearnableWeightedEnsembleModule(nn.Module):
         weights = None
         return aggregate_tensors(outputs, 
                                  lambda outputs: self._aggregate_tensors(outputs, weights))
+
+class EnsembleLoRAModule(nn.Module):
+    def __init__(self, base_model, adapter_list=[], weights=[], task_names=[]):
+        super().__init__()
+        self.base_model = base_model
+        self.dummy_adapter = nn.ModuleDict()
+        self.adapter_list = nn.ModuleList([])
+
+        # store one set of weights for the original base model
+        for name, module in self.base_model.named_modules():
+            if "lora" in name and isinstance(module, nn.Linear):
+                self.dummy_adapter[name.replace(".", "__")] = nn.Linear(module.in_features, module.out_features, bias=False)
+                self.dummy_adapter[name.replace(".", "__")].weight.requires_grad = False
+        
+        for i, adapter in enumerate(adapter_list):
+            if os.path.exists(adapter):
+                state_dict = torch.load(adapter, map_location=self.base_model.device)
+            else:
+                state_dict = None
+            self.adapter_list.append(nn.ModuleDict())
+            for name, module in self.base_model.named_modules():
+                if "lora" in name and isinstance(module, nn.Linear):
+                    self.adapter_list[i][name.replace(".", "__")] = nn.Linear(module.in_features, module.out_features, bias=False)    
+                    if state_dict is not None:
+                        self.adapter_list[i][name.replace(".", "__")].weight = nn.Parameter(state_dict[name + ".weight"].detach().clone().float())    
+        if type(weights[0]) is float:
+            self.task_to_weights = {task_name: weights for task_name in task_names}
+            self.weights = weights
+        else:
+            assert type(weights[0]) is list
+            self.task_to_weights = {task_name: weights[i] for i, task_name in enumerate(task_names)}
+            self.weights = weights[0]
+
+    def _aggregate_tensors(self, outputs):
+        weights = torch.Tensor(self.weights).to(self.base_model.device)
+        weights = cast(Tensor, weights).view(-1, *([1] * outputs[0].dim()))
+        return (torch.stack(outputs) * weights).sum(dim=0)
+    
+    def current_task(self, task_name):
+        self.weights = self.task_to_weights[task_name]
+    
+    def add_adapter(self, adapter, weight, state_dict=None):
+        idx = len(self.adapter_list)
+        if state_dict is not None:
+            state_dict = state_dict
+        elif os.path.exists(adapter):
+            state_dict = torch.load(adapter, map_location=self.base_model.device)
+        else:
+            print(f"Adapter {adapter} does not exist! Creating a random initialized adapter")
+            state_dict = None
+        self.adapter_list.append(nn.ModuleDict())
+        for name, module in self.base_model.named_modules():
+            if "lora" in name and isinstance(module, nn.Linear):
+                self.adapter_list[idx][name.replace(".", "__")] = nn.Linear(module.in_features, module.out_features, bias=False)
+                if state_dict is not None:    
+                    self.adapter_list[idx][name.replace(".", "__")].weight = nn.Parameter(state_dict[name + ".weight"].detach().clone().float())    
+        for i, task_name in enumerate(self.task_to_weights):
+            self.task_to_weights[task_name].append(weight[i] if isinstance(weight, list) else weight)
+
+    def _assign_weights(self, adapter_idx):
+        for name, module in self.base_model.named_modules():
+            if "lora" in name and isinstance(module, nn.Linear):
+                module.weight = self.adapter_list[adapter_idx][name.replace(".", "__")].weight 
+
+    def _revert_weights(self):
+        for name, module in self.base_model.named_modules():
+            if "lora" in name and isinstance(module, nn.Linear):
+                module.weight = self.dummy_adapter[name.replace(".", "__")].weight
+
+    def forward(self, *args, **kwargs):
+        outputs = []
+        for adapter_idx, adapter in enumerate(self.adapter_list):
+            self._assign_weights(adapter_idx)
+            outputs.append(self.base_model(*args, **kwargs))
+        # revert the weights back to the original base model
+        self._revert_weights()
+        return aggregate_tensors(outputs, self._aggregate_tensors)
+    
+
+class EnsembleAdapterModule(nn.Module):
+    def __init__(self, base_model, adapter_list=[], weights=[], use_bias=False, task_names=[]):
+        super().__init__()
+        self.base_model = base_model
+        self.dummy_adapter = nn.ModuleDict()
+        self.adapter_list = nn.ModuleList([])
+        self.use_bias = use_bias
+
+        # store one set of weights for the original base model
+        for name, module in self.base_model.named_modules():
+            if ("adapter_up" in name or "adapter_down" in name) and isinstance(module, nn.Linear):
+                self.dummy_adapter[name.replace(".", "__")] = nn.Linear(module.in_features, module.out_features, bias=self.use_bias)    
+                self.dummy_adapter[name.replace(".", "__")].weight.requires_grad = False
+                if self.use_bias:
+                    self.dummy_adapter[name.replace(".", "__")].bias.requires_grad = False
+        
+        for i, adapter in enumerate(adapter_list):
+            if os.path.exists(adapter):
+                state_dict = torch.load(adapter, map_location=self.base_model.device)
+            else:
+                state_dict = None
+            self.adapter_list.append(nn.ModuleDict())
+            for name, module in self.base_model.named_modules():
+                if ("adapter_up" in name or "adapter_down" in name) and isinstance(module, nn.Linear):
+                    self.adapter_list[i][name.replace(".", "__")] = nn.Linear(module.in_features, module.out_features, bias=self.use_bias)    
+                    if state_dict is not None:
+                        self.adapter_list[i][name.replace(".", "__")].weight = nn.Parameter(state_dict[name + ".weight"].detach().clone().float())   
+                        if self.use_bias:
+                            self.adapter_list[i][name.replace(".", "__")].bias = nn.Parameter(state_dict[name + ".bias"].detach().clone().float()) 
+        if type(weights[0]) is float:
+            self.task_to_weights = {task_name: weights for task_name in task_names}
+            self.weights = weights
+        else:
+            assert type(weights[0]) is list
+            self.task_to_weights = {task_name: weights[i] for i, task_name in enumerate(task_names)}
+            self.weights = weights[0]
+
+    def _aggregate_tensors(self, outputs):
+        weights = torch.Tensor(self.weights).to(self.base_model.device)
+        weights = cast(Tensor, weights).view(-1, *([1] * outputs[0].dim()))
+        return (torch.stack(outputs) * weights).sum(dim=0)
+    
+    def current_task(self, task_name):
+        self.weights = self.task_to_weights[task_name]
+
+    def add_adapter(self, adapter, weight, state_dict=None):
+        idx = len(self.adapter_list)
+        if state_dict is not None:
+            state_dict = state_dict
+        elif os.path.exists(adapter):
+            state_dict = torch.load(adapter, map_location=self.base_model.device)
+        else:
+            print(f"Adapter {adapter} does not exist! Creating a random initialized adapter")
+            state_dict = None
+        self.adapter_list.append(nn.ModuleDict())
+        for name, module in self.base_model.named_modules():
+            if ("adapter_up" in name or "adapter_down" in name) and isinstance(module, nn.Linear):
+                self.adapter_list[idx][name.replace(".", "__")] = nn.Linear(module.in_features, module.out_features, bias=self.use_bias)
+                if state_dict is not None:    
+                    self.adapter_list[idx][name.replace(".", "__")].weight = nn.Parameter(state_dict[name + ".weight"].detach().clone().float())    
+                    if self.use_bias:
+                            self.adapter_list[i][name.replace(".", "__")].bias = nn.Parameter(state_dict[name + ".bias"].detach().clone().float())
+        for i, task_name in enumerate(self.task_to_weights):
+            self.task_to_weights[task_name].append(weight[i] if isinstance(weight, list) else weight)
+
+    def _assign_weights(self, adapter_idx):
+        for name, module in self.base_model.named_modules():
+            if ("adapter_up" in name or "adapter_down" in name) and isinstance(module, nn.Linear):
+                module.weight = self.adapter_list[adapter_idx][name.replace(".", "__")].weight 
+                if self.use_bias:
+                    module.bias = self.adapter_list[adapter_idx][name.replace(".", "__")].bias
+
+    def _revert_weights(self):
+        for name, module in self.base_model.named_modules():
+            if ("adapter_up" in name or "adapter_down" in name) and isinstance(module, nn.Linear):
+                module.weight = self.dummy_adapter[name.replace(".", "__")].weight
+                if self.use_bias:
+                    module.bias = self.dummy_adapter[name.replace(".", "__")].bias
+
+    def forward(self, *args, **kwargs):
+        outputs = []
+        for adapter_idx, adapter in enumerate(self.adapter_list):
+            self._assign_weights(adapter_idx)
+            outputs.append(self.base_model(*args, **kwargs))
+
+        # revert the weights back to the original base model
+        self._revert_weights()
+        return aggregate_tensors(outputs, self._aggregate_tensors)

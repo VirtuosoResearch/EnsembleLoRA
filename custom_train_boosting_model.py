@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from peft import get_peft_model, LoraConfig
-from src.lqlora_utils import lora_utils
 
 import argparse
 import logging
@@ -12,7 +11,6 @@ import wandb
 
 from src.custom.glue_multitask_model import GLUEMultitaskModel
 from src.custom.glue_multitask_data_module import GLUEMultitaskDataModule
-from src.lqlora_utils import lora_utils
 
 from functools import partial
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, lambda_auto_wrap_policy, transformer_auto_wrap_policy, _or_policy
@@ -35,15 +33,16 @@ import pandas as pd
 from collections import defaultdict
 import time
 
-from torch._inductor.async_compile import AsyncCompile
-from src.merging_utils.ensemble import EnsembleAdapterModule
+from src.merging_utils.ensemble import EnsembleAdapterModule, EnsembleLoRAModule
+from adapters import AutoAdapterModel, DoubleSeqBnConfig
 
 def initialize_model(args):
     model_key = args.model_key.replace("/", "-").replace("..", "")
-    if "gpt" in model_key or "Llama" in model_key \
+    if "gpt" in args.model_key or "Llama" in model_key \
         or "bloomz" in model_key or "gemma" in model_key or "Mistral" in model_key:
         hf_key = args.model_key.replace("_", "-")
         tokenizer = AutoTokenizer.from_pretrained(hf_key)
+        tokenizer.padding_side = 'right'
         if args.use_qlora:
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
@@ -65,7 +64,51 @@ def initialize_model(args):
     else:
         raise NotImplementedError(args.model_key)
     
+    if args.train_adapter:
+        
+        if args.use_qadapter:
+            quantization_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type='nf4' 
+            )
+
+            model = AutoAdapterModel.from_pretrained(
+                hf_key, 
+                quantization_config=quantization_config, 
+                torch_dtype=torch.bfloat16, 
+                device_map={"": args.devices[0]}
+            )
+        
+        else: model = AutoAdapterModel.from_pretrained(hf_key)
+
+        bottleneck_config = DoubleSeqBnConfig(
+            mh_adapter=True,    
+            output_adapter=True,    
+            reduction_factor=args.reduction_factor,     
+            non_linearity="relu",
+            dropout=0.1,     
+        )
+
+        model.add_adapter(adapter_name="seq_bn",config=bottleneck_config)
+        model.adapter_to("seq_bn", f"cuda:{args.devices[0]}", torch.bfloat16)
+        model.heads.default[0].weight.data = model.heads.default[0].weight.data.to(torch.bfloat16)
+
+        for name, param in model.named_parameters():
+            if "adapter" not in name:
+                param.requires_grad = False
+
+        model.set_active_adapters("seq_bn")
+        trainable_params_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        all_params_count = sum(p.numel() for p in model.parameters())
+
+        print(f"Trainable parameters: {trainable_params_count} || All parameters: {all_params_count} || ratio: {trainable_params_count/all_params_count}")
+        print("-"*20,"Bottleneck_Adapter","-"*20)
+
+    
     if args.use_3bit or args.use_2bit:
+        from src.lqlora_utils import lora_utils
         model = lora_utils.prepare_model_for_lora(
             model=model,
             num_ranks=args.lora_rank,
@@ -120,7 +163,39 @@ def initialize_model(args):
         model = get_peft_model(model, config)
         model.print_trainable_parameters()
 
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     return model, tokenizer, hf_key, model_type, append_eos
+
+''' Linear Approximation: linear regression '''
+def generate_state_dict(model, state_dict, coef, device="cpu", removing_keys = ["shared", "lm_head", "wte", "wpe", "ln", "embed_tokens", "norm", "word_embeddings", "quant", "absmax"]):
+    new_state_dict = {}; cur_len = 0
+    for key, param in model.named_parameters():
+        param_len = param.numel()
+        if any([rkey in key for rkey in removing_keys]):
+            continue
+        else:
+            if "lora" in key or "adapter" in key:
+                new_state_dict[key] = state_dict[key].clone().to(device) + \
+                    torch.Tensor(coef[cur_len:cur_len+param_len].reshape(param.shape)).to(device)
+                cur_len += param_len
+    return new_state_dict
+
+def solve_linear_regression(lm, state_dict, gradients, outputs, residuals, alpha=1.0):
+    from sklearn.linear_model import Ridge
+
+    y = (residuals - outputs)
+    reg = Ridge(alpha=alpha).fit(gradients, y)
+
+    coef = reg.coef_
+    project_matrix = lm.project_matrix
+    coef = project_matrix @ coef.flatten()
+    print("L2 norm before scaling", np.linalg.norm(coef))
+
+    # evaluate task performances
+    new_state_dict = generate_state_dict(lm.model, state_dict, coef, device=lm.model.device)
+    return new_state_dict
 
 
 def aggregate_predictions_adaboost(outputs):
@@ -162,7 +237,10 @@ def aggregate_predictions_gradient_boosting(outputs):
 
         is_label_mask = labels != -100
         valid_labels = labels[is_label_mask].view(-1)
-        residuals[mask>0] = (1 - correct_class_probs).cpu().numpy()
+        if len(residuals) == 1:
+            residuals = (1 - correct_class_probs).cpu().numpy() if mask[0] else np.zeros(len(labels))
+        else:
+            residuals[mask] = (1 - correct_class_probs).cpu().numpy()
         
         all_residuals.append(residuals)
         masks.append(mask)
@@ -211,47 +289,13 @@ def aggregate_metrics(outputs, task_names):
     print(summary)
     return summary
 
-''' Linear Approximation: linear regression '''
-def generate_state_dict(model, state_dict, coef, device="cpu", removing_keys = ["shared", "lm_head", "wte", "wpe", "ln", "embed_tokens", "norm", "word_embeddings"]):
-    new_state_dict = {}; cur_len = 0
-    for key, param in model.named_parameters():
-        if not param.requires_grad: continue
-        param_len = param.numel()
-        if any([rkey in key for rkey in removing_keys]):
-            continue
-            # new_state_dict[key] = state_dict[key].clone()
-        else:
-            assert "lora" in key
-            new_state_dict[key] = state_dict[key].clone().to(device) + \
-                torch.FloatTensor(coef[cur_len:cur_len+param_len].reshape(param.shape)).to(device)
-            cur_len += param_len
-    return new_state_dict
-
-def solve_linear_regression(lm, state_dict, gradients, outputs, residuals, scale=None):
-    from sklearn.linear_model import LinearRegression, Ridge
-
-    y = - (residuals + outputs)
-    reg = Ridge().fit(gradients, y)
-
-    coef = reg.coef_
-    project_matrix = lm.project_matrix
-    coef = project_matrix @ coef.flatten()
-    print("L2 norm before scaling", np.linalg.norm(coef))
-    if scale is not None:
-        coef = coef*scale / np.linalg.norm(coef)
-    print("L2 norm after scaling", np.linalg.norm(coef))
-
-    # evaluate task performances
-    new_state_dict = generate_state_dict(lm.model, state_dict, coef, device=lm.model.device)
-    return new_state_dict
-
-
 def main(args):
     # Initialize the model
     model_key = args.model_key.replace("/", "-").replace("..", "")
-    save_name = (f"_{args.save_name}" if args.save_name else "") + \
-                (f"_lora_r_{args.lora_rank}" if args.train_lora else "")         
-    gradients_dir = save_name + f"_dim_{args.project_gradients_dim}_seed_{args.compute_gradients_seeds[0]}"
+    save_name = (f"{args.save_name}_{model_key}" if args.save_name else "") + \
+                (f"_lora_r_{args.lora_rank}" if args.train_lora else "") 
+    seed_str = "_".join([str(seed) for seed in args.compute_gradients_seeds])
+    gradients_dir = save_name + f"_dim_{args.project_gradients_dim}_seed_{seed_str}"
 
     model, tokenizer, hf_key, model_type, append_eos = initialize_model(args)
     if tokenizer.pad_token is None:
@@ -269,7 +313,11 @@ def main(args):
             tokenizer=tokenizer,
             batch_size=batch_size,
             inference_batch_size=inference_batch_size,
-            max_input_length=args.max_length)
+            max_input_length=args.max_length,
+            val_split_ratio=args.val_split_ratio,
+            downsample_ratio=args.downsample_ratio,
+            minimum_samples=args.minimum_samples,
+            minimum_samples_validation=args.minimum_samples_validation)
     data_module.setup(stage="fit")
 
     task_answer_choices = {}
@@ -294,11 +342,11 @@ def main(args):
     def get_lora_state_dict(model):
         state_dict = {}
         for name, weight in model.state_dict().items():
-            if "lora" in name:
+            if "lora" in name or "adapter" in name:
                 state_dict[name] = weight.detach().clone().to(f"cuda:{args.devices[0]}")
         return state_dict
 
-    initial_lora_state_dict = get_lora_state_dict(model)
+    initial_lora_state_dict = torch.load(os.path.join(os.path.join("gradients", gradients_dir), "initial_weights.pt"), map_location="cpu")
 
     lm = GLUEMultitaskModel(model, tokenizer, model_type, use_cpu_offload=False,
                     lr=args.lr, weight_decay=args.weight_decay, max_length=args.max_length, use_wandb=args.use_wandb, 
@@ -353,12 +401,17 @@ def main(args):
         # checkpoint = torch.load(load_model_dir, map_location="cpu")
         # model.load_state_dict(checkpoint, strict=False)
         load_model_dirs.append(load_model_dir)
-    weights = [1.0/len(load_model_dirs) for _ in range(len(load_model_dirs))]
+    if args.load_task_weights is not None:
+        with open(args.load_task_weights, "r") as f:
+            weights = [[float(item) for item in line.strip().split()] for line in f.readlines()]
+    else:
+        weights = [1.0/len(load_model_dirs) for _ in range(len(load_model_dirs))]
 
     # only using the ensemble model for evaluation now
-    _ensemble_model = EnsembleAdapterModule(model, load_model_dirs, weights)
+    _ensemble_model = EnsembleLoRAModule(model, load_model_dirs, weights, args.task_names) if args.train_lora else \
+                      EnsembleAdapterModule(model, load_model_dirs, weights, args.task_names)
     ensemble_model = GLUEMultitaskModel(_ensemble_model, tokenizer, model_type, use_cpu_offload=False,
-                    lr=args.lr, weight_decay=args.weight_decay, max_length=args.max_length, use_wandb=args.use_wandb, 
+                    lr=args.lr, weight_decay=args.weight_decay, max_length=args.max_length, use_wandb=args.use_wandb, use_ensemble=True,
                     optimizer=args.optimizer, generate_output=args.generate_output, task_names=args.task_names, task_answer_choices=task_answer_choices)
     # initial validation
     trainer.validate(ensemble_model, dataloaders=data_module.val_dataloader())
@@ -380,19 +433,39 @@ def main(args):
             model.load_state_dict(initial_lora_state_dict, strict=False) # re-initialize the adapter weights
             if args.fit_linear_regression:
                 # Load gradients 
-                gradient_idxes = []
-                for task_idx in args.task_idxes:
-                    gradient_idxes += tasks_to_indices[task_idx]
+                def load_gradient_features(seed, task_name, gradient_idxes):
+                    cur_gradients_dir = gradients_dir.replace(f"seed_{args.compute_gradients_seeds[0]}", f"seed_{seed}")
 
-                gradients = []; outputs = []
-                for idx in gradient_idxes:
-                    if os.path.exists(f"./gradients/{gradients_dir}/train_batch_{idx}_gradients.npy"):
-                        gradients.append(np.load(f"./gradients/{gradients_dir}/train_batch_{idx}_gradients.npy"))
-                        outputs.append(np.load(f"./gradients/{gradients_dir}/train_batch_{idx}_outputs.npy")[:, 0])
-                gradients = np.concatenate(gradients, axis=0)
-                pretrained_outputs = np.concatenate(outputs, axis=0)
-                new_state_dict = solve_linear_regression(lm, initial_lora_state_dict, gradients, pretrained_outputs, residuals)
-                checkpoint_dir =  os.path.join(default_root_dir, "epoch_0" + f"_gradient_boosting_{task_names_str}_iteration_{est_idx}" + ".pt")
+                    gradients = []
+                    for filename in os.listdir(f"./gradients/{cur_gradients_dir}/{task_name}"):
+                        if filename.endswith("_gradients.npy"):
+                            gradients.append(np.load(f"./gradients/{cur_gradients_dir}/{task_name}/{filename}"))
+                    gradients = np.concatenate(gradients, axis=0)
+                    return gradients
+                
+                def load_outputs(seed, task_name, gradient_idxes):
+                    cur_gradients_dir = gradients_dir.replace(f"seed_{args.compute_gradients_seeds[0]}", f"seed_{seed}")
+
+                    outputs = []
+                    for filename in os.listdir(f"./gradients/{cur_gradients_dir}/{task_name}"):
+                        if filename.endswith("_outputs.npy"):
+                            outputs.append(np.load(f"./gradients/{cur_gradients_dir}/{task_name}/{filename}"))
+                    outputs = np.concatenate(outputs, axis=0)
+                    outputs = outputs[:, 0]
+                    outputs = outputs[outputs != 0] # in case the outputs are cut off by the maximum length
+                    return outputs
+                
+                all_gradients = []; all_outputs = []
+                for task_idx in range(len(args.task_names)):
+                    task_gradients = load_gradient_features(args.compute_gradients_seeds[0], args.task_names[task_idx], tasks_to_indices[task_idx])
+                    task_outputs = load_outputs(args.compute_gradients_seeds[0], args.task_names[task_idx], tasks_to_indices[task_idx])
+                    all_gradients.append(task_gradients); all_outputs.append(task_outputs)
+                all_gradients = np.concatenate(all_gradients, axis=0)
+                all_outputs = np.concatenate(all_outputs, axis=0) if all_outputs[0] is not None else None
+                
+                new_state_dict = solve_linear_regression(lm, initial_lora_state_dict, all_gradients, all_outputs, residuals, alpha=args.lr_alpha)
+                task_names_str = "_".join(args.task_names)
+                checkpoint_dir =  os.path.join(default_root_dir, f"gradient_boosting_{task_names_str}_iteration_{est_idx}" + ".pt")
                 torch.save(new_state_dict, checkpoint_dir)
             else:
                 checkpoint_callback = ModelCheckpoint(
@@ -478,6 +551,14 @@ if __name__ == "__main__":
     parser.add_argument("--use_qlora", action="store_true")
     parser.add_argument("--use_3bit", action="store_true")
     parser.add_argument("--use_2bit", action="store_true")
+    parser.add_argument("--val_split_ratio", type=float, default=0.1)
+    parser.add_argument("--downsample_ratio", type=float, default=0.5)
+    parser.add_argument("--minimum_samples", type=int, default=500)
+    parser.add_argument("--minimum_samples_validation", type=int, default=200)
+
+    parser.add_argument("--train_adapter", action="store_true")
+    parser.add_argument("--reduction_factor", type=int, default=128)
+    parser.add_argument("--use_qadapter", action="store_true")
 
     parser.add_argument("--train_lora", action="store_true")
     parser.add_argument("--lora_rank", type=int, default=4)
@@ -486,6 +567,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_name", type=str, default=None)
 
     parser.add_argument("--load_model_dirs", type=str, nargs="+", default=["meta-llama-Llama-3.2-1B_cb_multirc_lora_r_16_task_grouping_2_run_0/epoch_epoch=3.pt"])
+    parser.add_argument("--load_task_weights", type=str, default=None, help="Path to the task weights file to load")
     parser.add_argument("--write_results", action="store_true")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--generate_output", action="store_true")
@@ -496,10 +578,9 @@ if __name__ == "__main__":
     parser.add_argument("--n_estimators", type=int, default=10)
     parser.add_argument("--gradient_boosting_lr", type=float, default=0.2)
     parser.add_argument("--fit_linear_regression", action="store_true")
+    parser.add_argument("--lr_alpha", type=float, default=10) # alpha for the ridge regression
     parser.add_argument("--compute_gradients_seeds", type=int, nargs="+", default=[0])
-    parser.add_argument("--project_gradients_dim", type=int, default=200)
-    parser.add_argument("--scale", type=float, default=0.1)
-    parser.add_argument("--task_idxes", type=int, nargs="+", default=None)
+    parser.add_argument("--project_gradients_dim", type=int, default=400)
     args = parser.parse_args()
 
     main(args)

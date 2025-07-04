@@ -1,4 +1,3 @@
-# %% 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -121,7 +120,6 @@ def initialize_model(args):
 
     return model, tokenizer, hf_key, model_type, append_eos
 
-# %%
 class args:
     model_key = "meta-llama/Llama-3.1-8B"
     batch_size = 4
@@ -156,8 +154,6 @@ class args:
     n_estimators = 10
 
     
-
-# %%
 # Initialize the model
 model_key = args.model_key.replace("/", "-").replace("..", "")
 save_name = (f"_{args.save_name}" if args.save_name else "") + \
@@ -193,7 +189,6 @@ if not os.path.exists(default_root_dir):
     os.makedirs(default_root_dir)
 
 
-# %%
 num_epochs = 1
 batch_size_of_users = 10
 

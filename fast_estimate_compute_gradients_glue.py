@@ -130,7 +130,7 @@ def initialize_model(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task_names", type=str, nargs="+", default=["cola"])
+    parser.add_argument("--task_names", type=str, nargs="+", default=["cb", "rte", "copa", "wic", "wsc.fixed", "boolq", "multirc", "winogrande_debiased", "story_cloze", "hellaswag"])
     parser.add_argument("--model_key", type=str, default="gpt2")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--inference_batch_size", type=int, default=None)
@@ -141,7 +141,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight_decay", type=float, default=0)
     parser.add_argument("--disable_checkpointing", action="store_true")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=0)
     parser.add_argument("--max_length", type=int, default=256)
     parser.add_argument("--task_idxes", type=int, nargs="+", default=None)
     parser.add_argument("--save_every_epoch", action="store_true")
@@ -223,6 +223,7 @@ if __name__ == "__main__":
             batch_size=batch_size,
             inference_batch_size=inference_batch_size,
             max_input_length=args.max_length,
+            val_split_ratio=args.val_split_ratio,
             downsample_ratio=args.downsample_ratio,
             minimum_samples=args.minimum_samples,
             minimum_samples_validation=args.minimum_samples_validation)
