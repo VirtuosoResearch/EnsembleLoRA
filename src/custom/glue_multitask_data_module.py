@@ -15,7 +15,7 @@ import tqdm
 import random
 
 from utils.multitask_dataset import MultitaskDataset, MultitaskBatchSampler, MultitaskCollator
-from custom.glue_task_constants import task_to_benchmark, task_to_instruction_template, task_is_generative_task, task_to_answer_choices
+from custom.task_constants import task_to_benchmark, task_to_instruction_template, task_is_generative_task, task_to_answer_choices
 from utils.template_utils import apply_template
 from datasets import load_dataset
 from promptsource.templates import DatasetTemplates, Template
@@ -150,7 +150,8 @@ class GLUEMultitaskDataModule(pl.LightningDataModule):
         downsample_ratio=1.0, # ratio of downsampling
         minimum_samples=100,
         minimum_samples_validation=100,
-        downsample_seed=0
+        downsample_seed=0,
+        mode="train"
     ):
         super().__init__()
 
@@ -168,6 +169,7 @@ class GLUEMultitaskDataModule(pl.LightningDataModule):
         self.downsample_seed = downsample_seed
         self.minimum_sample = minimum_samples
         self.minimum_sample_validation = minimum_samples_validation
+        self.mode = mode
 
         '''
         Add this to pytorch lightning "pytorch_lightning/utilities/data.py" line 282:
@@ -314,6 +316,7 @@ class GLUEMultitaskDataModule(pl.LightningDataModule):
                 # Select datasets
                 train_dataset = full_train_dataset.select(train_indices)
                 eval_dataset = full_train_dataset.select(val_indices)
+                if len(full_train_dataset) < 1000 and self.mode == "eval": eval_dataset = predict_dataset
 
             # Downsample datasets            
             if self.downsample_rate < 1.0:

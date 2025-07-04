@@ -17,7 +17,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import numpy as np
 import pytorch_lightning as pl
 import torch
-from transformers import AutoModelForSeq2SeqLM, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from transformers import AutoModelForSeq2SeqLM, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, LlamaTokenizerFast
 from transformers.models.gpt_neo.modeling_gpt_neo import GPTNeoBlock
 from transformers.models.llama.modeling_llama import LlamaDecoderLayer
 from torch.nn import Embedding
@@ -90,7 +90,7 @@ def initialize_model(args):
     if "gpt" in args.model_key or "Llama" in model_key \
         or "bloomz" in model_key or "gemma" in model_key or "Mistral" in model_key:
         hf_key = args.model_key.replace("_", "-")
-        tokenizer = AutoTokenizer.from_pretrained(hf_key)
+        tokenizer = LlamaTokenizerFast.from_pretrained(hf_key, use_fast=True)
         tokenizer.padding_side = 'right'
         if args.use_qlora:
             quantization_config = BitsAndBytesConfig(
@@ -104,6 +104,8 @@ def initialize_model(args):
             model = AutoModelForCausalLM.from_pretrained(hf_key)
         model_type = "decoder"
         append_eos = True
+        tokenizer.add_bos_token = False
+        tokenizer.add_eos_token = False
     elif "flan" in model_key:
         hf_key = "google/{}".format(model_key.replace("_", "-"))
         model = AutoModelForSeq2SeqLM.from_pretrained(hf_key)
@@ -172,7 +174,7 @@ def initialize_model(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--task_names", type=str, nargs="+", default=["cola"])
+    parser.add_argument("--task_names", type=str, nargs="+", default=["cb", "rte", "copa", "wic", "wsc.fixed", "boolq", "multirc", "winogrande_debiased", "story_cloze", "hellaswag"])
     parser.add_argument("--model_key", type=str, default="gpt2")
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--inference_batch_size", type=int, default=None)
@@ -191,6 +193,7 @@ if __name__ == "__main__":
     parser.add_argument("--downsample_ratio", type=float, default=0.5)
     parser.add_argument("--minimum_samples", type=int, default=500)
     parser.add_argument("--minimum_samples_validation", type=int, default=200)
+    parser.add_argument("--mode", type=str, default="eval")
 
     parser.add_argument("--optimizer", type=str, default="adamw")
     parser.add_argument("--use_qlora", action="store_true")
@@ -211,13 +214,16 @@ if __name__ == "__main__":
 
     # compute gradient arguments
     parser.add_argument("--compute_gradients_seeds", type=int, nargs="+", default=[0])
-    parser.add_argument("--project_gradients_dim", type=int, default=200)
+    parser.add_argument("--project_gradients_dim", type=int, default=-1)
     parser.add_argument("--scale", type=float, default=0.1)
-    parser.add_argument("--regularization_lambda", type=float, default=1)
     parser.add_argument("--number_of_subsets", type=int, default=100)
     parser.add_argument("--subset_size", type=float, default=0.5)
     parser.add_argument("--load_sample_task_dir", type=str, default=None)
-    parser.add_argument("--downsample", type=int, default=5000)
+    parser.add_argument("--lr_regularization_lambda", type=float, default=1)
+    parser.add_argument("--lr_downsample", type=int, default=1e6)
+    parser.add_argument("--lr_upsample", type=int, default=1000)
+    parser.add_argument("--lr_iters", type=int, default=40)
+    parser.add_argument("--lr_customize", action="store_true")
     parser.add_argument("--use_initialization", action="store_true")
 
     parser.add_argument("--use_ensemble", action="store_true")
@@ -225,9 +231,6 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     args.enable_checkpointing = not args.disable_checkpointing
-    print("arguments".upper().center(80, "-"))
-    print(args)
-    print("-" * 80)
 
     ''' Constants '''
     model_key = args.model_key.replace("/", "-").replace("..", "")
@@ -236,11 +239,11 @@ if __name__ == "__main__":
     gradients_dir = save_name + f"_dim_{args.project_gradients_dim}_seed_{args.compute_gradients_seeds[0]}" # + ("_pretrained" if not os.path.exists(args.load_model_dir) else "")
     load_model_dir = os.path.join(os.path.join("gradients", gradients_dir), "initial_weights.pt")
     file_dir = os.path.join("./results/", save_name + \
-                            f"_size_{args.subset_size}_scale_{args.scale}_lambda_{args.regularization_lambda}_downsample_{args.downsample}" + \
+                            f"_subsets_{args.number_of_subsets}_size_{args.subset_size}_lambda_{args.lr_regularization_lambda}_iter_{args.lr_iters}" + \
                             (f"_pretrained" if args.use_initialization else ""))
     if not os.path.exists(file_dir):
         os.mkdir(file_dir)
-    sampled_task_dir = save_name + f"_size_{args.subset_size}_scale_{args.scale}"
+    sampled_task_dir = save_name + f"_subsets_{args.number_of_subsets}_size_{args.subset_size}"
     
     if not os.path.exists("external_lightning_logs"):
             raise Exception("external_lightning_logs/ does not exist")
@@ -276,10 +279,11 @@ if __name__ == "__main__":
             batch_size=batch_size,
             inference_batch_size=inference_batch_size,
             max_input_length=args.max_length,
-            val_split_ratio=0,
+            val_split_ratio=args.val_split_ratio,
             downsample_ratio=args.downsample_ratio,
             minimum_samples=args.minimum_samples,
-            minimum_samples_validation=args.minimum_samples_validation)
+            minimum_samples_validation=args.minimum_samples_validation,
+            mode=args.mode)
     data_module.setup(stage="fit")
 
     task_answer_choices = {}
@@ -294,29 +298,11 @@ if __name__ == "__main__":
                 answer_choices = [tokenizer([choice])["input_ids"][0][1] for choice in answer_choices]; answer_choices.sort()
         elif "Llama-3" in args.model_key:
             answer_choices = [" " + choice.strip() for choice in answer_choices] 
-            answer_choices = [tokenizer([choice])["input_ids"][0][1] for choice in answer_choices]; answer_choices.sort()
+            answer_choices = [tokenizer([choice])["input_ids"][0][0] for choice in answer_choices]; answer_choices.sort()
         else:
             answer_choices = [" " + choice.strip() for choice in answer_choices] 
             answer_choices = [tokenizer([choice])["input_ids"][0][0] for choice in answer_choices]; answer_choices.sort()
         task_answer_choices[task_name] = answer_choices
-
-    # for task in data_module.task_to_templates:
-    #     train_dataset = data_module.task_to_train_datasets[task]
-    #     for answer_choice in data_module.task_to_templates[task].answer_choices.split("|||"):
-    #         answer_choice = answer_choice.strip()
-    #         print("Answer: ", answer_choice, "Num samples:", np.sum([1 for output in train_dataset["output"] if output == answer_choice]))
-
-    #     print("Validation")
-    #     valid_dataset = data_module.task_to_valid_datasets[task]
-    #     for answer_choice in data_module.task_to_templates[task].answer_choices.split("|||"):
-    #         answer_choice = answer_choice.strip()
-    #         print("Answer: ", answer_choice, "Num samples:", np.sum([1 for output in valid_dataset["output"] if output == answer_choice]))
-
-    #     print("Test")
-    #     test_dataset = data_module.task_to_test_datasets[task]
-    #     for answer_choice in data_module.task_to_templates[task].answer_choices.split("|||"):
-    #         answer_choice = answer_choice.strip()
-    #         print("Answer: ", answer_choice, "Num samples:", np.sum([1 for output in test_dataset["output"] if output == answer_choice]))
 
     if args.use_ensemble:
         model = EnsembleLoRAModule(model, [], [])
@@ -359,7 +345,7 @@ if __name__ == "__main__":
         from sklearn.metrics import log_loss
 
         if outputs is not None:
-            X = np.concatenate([gradients, -outputs.reshape(-1, 1)], axis=1)
+            X = np.concatenate([gradients, outputs.reshape(-1, 1)], axis=1) # f_theta^star + gX
         else:
             X = gradients
 
@@ -382,7 +368,7 @@ if __name__ == "__main__":
             return loss + l2_penalty
         
         initial_guess = np.zeros(X.shape[1] - 1) if outputs is not None else np.zeros(X.shape[1])
-        result = minimize(logistic_loss, initial_guess, method='BFGS', options={'maxiter': 10})
+        result = minimize(logistic_loss, initial_guess, method='BFGS', options={'maxiter': args.lr_iters})
         print(result)
 
         # evaluate the trained model
@@ -394,12 +380,11 @@ if __name__ == "__main__":
 
     def fit_linear_model(gradients, outputs=None, labels=None, seed=0, use_customized_process=True):
         if use_customized_process:
-            proj_coef = customize_logistic_regression(gradients, outputs=outputs, l2_strength=args.regularization_lambda)
-            print("L2 norm before projection", np.linalg.norm(proj_coef))
+            proj_coef = customize_logistic_regression(gradients, outputs=outputs, l2_strength=args.lr_regularization_lambda)
         else:
             if labels is None:
                 # randomly assign labels as 0 or 1
-                labels = np.random.binomial(n=1, p=0.5, size=gradients.shape[0])
+                labels = np.random.binomial(n=1, p=0.7, size=gradients.shape[0])
                 # reverse the gradients for the 0 labels
                 mask = np.copy(labels)
                 mask[labels == 0] = -1
@@ -418,149 +403,125 @@ if __name__ == "__main__":
 
             if outputs is None:
                 # estimate parameters: train a logistic regression model
-                clf = LogisticRegression(penalty='l2',  solver='lbfgs', C=1/args.regularization_lambda) 
+                clf = LogisticRegression(penalty='l2',  solver='lbfgs', C=1/args.lr_regularization_lambda) 
                 clf.fit(gradients, labels)
                 print("Linear regression score: ", clf.score(gradients, labels))
                 proj_coef = clf.coef_.copy().flatten().reshape(-1, 1)
-                print("L2 norm before projection", np.linalg.norm(proj_coef))
             else:
                 # concatenate outputs
-                print("Also using outputs for linear regression")
                 outputs = outputs*mask.flatten()
                 gradients = np.concatenate([gradients, -outputs.reshape(-1, 1)], axis=1)
                 # estimate parameters: train a logistic regression model
-                clf = LogisticRegression(penalty='l2',  solver='lbfgs', C=1/args.regularization_lambda, fit_intercept=False) 
+                clf = LogisticRegression(penalty='l2',  solver='lbfgs', C=1/args.lr_regularization_lambda, fit_intercept=False) 
                 clf.fit(gradients, labels)
                 print("Linear regression score: ", clf.score(gradients, labels))
                 proj_coef = clf.coef_.copy().flatten().reshape(-1, 1)[:-1] # remove the last column corresponding to the output
-                print("L2 norm before projection", np.linalg.norm(proj_coef))
             
         # convert the coefficients to the original space
         if seed != lm.current_project_seed:
             lm.initialize_project_matrix(seed=seed)
         project_matrix = lm.project_matrix
-        coef = project_matrix @ proj_coef.flatten()
+        if project_matrix is not None:
+            coef = project_matrix @ proj_coef.flatten()
+        else:
+            coef = proj_coef.flatten()
         print("L2 norm before scaling", np.linalg.norm(coef))
 
-        # coef = coef * scale / np.linalg.norm(coef)
-        # print("L2 norm after scaling", np.linalg.norm(coef))
         return coef
 
-    def load_gradient_features(seed, gradient_idxes):
+
+    def load_gradient_features(seed, task_name, gradient_idxes):
         cur_gradients_dir = gradients_dir.replace(f"seed_{args.compute_gradients_seeds[0]}", f"seed_{seed}")
 
         gradients = []
         for idx in gradient_idxes:
-            if os.path.exists(f"./gradients/{cur_gradients_dir}/train_batch_{idx}_gradients.npy"):
-                gradients.append(np.load(f"./gradients/{cur_gradients_dir}/train_batch_{idx}_gradients.npy"))
+            if os.path.exists(f"./gradients/{cur_gradients_dir}/{task_name}/train_batch_{idx}_gradients.npy"):
+                gradients.append(np.load(f"./gradients/{cur_gradients_dir}/{task_name}/train_batch_{idx}_gradients.npy"))
             else:
-                print(f"Gradient for ./gradients/{cur_gradients_dir}/train_batch_{idx}_gradients.npy does not exist")
+                print(f"Gradient for ./gradients/{cur_gradients_dir}/{task_name}/train_batch_{idx}_gradients.npy does not exist")
         gradients = np.concatenate(gradients, axis=0)
         return gradients
 
-    def load_labels(seed, gradient_idxes):
+    def load_labels(seed, task_name, gradient_idxes):
         cur_gradients_dir = gradients_dir.replace(f"seed_{args.compute_gradients_seeds[0]}", f"seed_{seed}")
 
         labels = []
         for idx in gradient_idxes:
-            if os.path.exists(f"./gradients/{cur_gradients_dir}/train_batch_{idx}_labels.npy"):
-                labels.append(np.load(f"./gradients/{cur_gradients_dir}/train_batch_{idx}_labels.npy"))
+            if os.path.exists(f"./gradients/{cur_gradients_dir}/{task_name}/train_batch_{idx}_labels.npy"):
+                labels.append(np.load(f"./gradients/{cur_gradients_dir}/{task_name}/train_batch_{idx}_labels.npy"))
             else:
-                print(f"Gradient for ./gradients/{cur_gradients_dir}/train_batch_{idx}_labels.npy does not exist")
+                print(f"Gradient for ./gradients/{cur_gradients_dir}/{task_name}/train_batch_{idx}_labels.npy does not exist")
         labels = np.concatenate(labels, axis=0)
         return labels
 
-    def load_outputs(seed, gradient_idxes):
+    def load_outputs(seed, task_name, gradient_idxes):
         cur_gradients_dir = gradients_dir.replace(f"seed_{args.compute_gradients_seeds[0]}", f"seed_{seed}")
 
         outputs = []
         for idx in gradient_idxes:
-            if os.path.exists(f"./gradients/{cur_gradients_dir}/train_batch_{idx}_outputs.npy"):
-                outputs.append(np.load(f"./gradients/{cur_gradients_dir}/train_batch_{idx}_outputs.npy"))
+            if os.path.exists(f"./gradients/{cur_gradients_dir}/{task_name}/train_batch_{idx}_outputs.npy"):
+                outputs.append(np.load(f"./gradients/{cur_gradients_dir}/{task_name}/train_batch_{idx}_outputs.npy"))
             else:
-                print(f"Gradient for ./gradients/{cur_gradients_dir}/train_batch_{idx}_outputs.npy does not exist")
+                print(f"Gradient for ./gradients/{cur_gradients_dir}/{task_name}/train_batch_{idx}_outputs.npy does not exist")
         outputs = np.concatenate(outputs, axis=0)
         outputs = outputs[:, 0]
+        outputs = outputs[outputs != 0] # in case the outputs are cut off by the maximum length
         return outputs
 
-    def augment_gradients(gradients, num_copies=1):
+    def augment_gradients(gradients, outputs=None, num_copies=1):
         # augment the gradients by duplicating them
         augmented_gradients = [np.copy(gradients)]
+        augmented_outputs = [np.copy(outputs)] if outputs is not None else None
         for i in range(num_copies):
             new_gradients_1 = np.copy(gradients); permute_1 = np.random.permutation(gradients.shape[0])
             new_gradients_2 = np.copy(gradients); permute_2 = np.random.permutation(gradients.shape[0])
-            print("Permutation 1", permute_1); print("Permutation 2", permute_2)
             new_gradients = (new_gradients_1[permute_1] + new_gradients_2[permute_2]) / 2
             augmented_gradients.append(new_gradients)
+            if outputs is not None:
+                outputs_1 = np.copy(outputs); outputs_2 = np.copy(outputs)
+                new_outputs = (outputs_1[permute_1] + outputs_2[permute_2]) / 2
+                augmented_outputs.append(new_outputs)
         augmented_gradients = np.concatenate(augmented_gradients, axis=0)
-        return augmented_gradients
+        if outputs is not None: augmented_outputs = np.concatenate(augmented_outputs, axis=0)
+        return augmented_gradients, augmented_outputs
 
     def gradient_based_estimation(task_idxes, repeat=1, seeds=[0]):
         if args.use_initialization:
             lm.model.load_state_dict(state_dict)
         else:
-            gradient_idxes = []
-            for task_idx in task_idxes:
-                gradient_idxes += tasks_to_indices[task_idx]
+            coefs = []
+            for trial in range(repeat):
+                # load gradients
+                all_gradients = []; all_outputs = []
+                for task_idx in task_idxes:
+                    task_gradients = load_gradient_features(seeds[trial], args.task_names[task_idx], tasks_to_indices[task_idx])
+                    task_outputs = load_outputs(seeds[trial], args.task_names[task_idx], tasks_to_indices[task_idx])
+                    if len(task_gradients) > args.lr_downsample:
+                        # subsample gradient features for logistic regression
+                        rng = np.random.default_rng(trial)
+                        choice_idxes = rng.choice(task_gradients.shape[0], args.lr_downsample, replace=False)
+                        task_gradients = task_gradients[choice_idxes]
+                        task_outputs = task_outputs[choice_idxes] if task_outputs is not None else None
+                    elif len(task_gradients) < args.lr_upsample:
+                        copies = int(np.ceil(args.lr_upsample / len(task_gradients))) - 1
+                        if copies > 1:
+                            task_gradients, task_outputs = augment_gradients(task_gradients, outputs=task_outputs, num_copies=copies)
 
-            if args.use_ensemble:
-                for trial in range(repeat):
-                    # load gradients
-                    all_gradients = load_gradient_features(seeds[trial], gradient_idxes)
-                    all_outputs = load_outputs(seeds[trial], gradient_idxes)
-                    if len(all_gradients) == 0:
-                        return {}
+                    all_gradients.append(task_gradients); all_outputs.append(task_outputs)
+                all_gradients = np.concatenate(all_gradients, axis=0)
+                all_outputs = np.concatenate(all_outputs, axis=0) if all_outputs[0] is not None else None
 
-                    # subsample gradients
-                    rng = np.random.default_rng(trial)
-                    if all_gradients.shape[0] > args.downsample:
-                        choice_idxes = rng.choice(all_gradients.shape[0], args.downsample, replace=False)
-                        gradients = all_gradients[choice_idxes]
-                        outputs = all_outputs[choice_idxes]
-                    else:
-                        gradients = np.copy(all_gradients)
-                        outputs = np.copy(all_outputs)
-
-                    print("Number of gradients for logistic regression", gradients.shape)
-                    coef = fit_linear_model(gradients, outputs=outputs, seed=seeds[trial])
-                    new_state_dict = generate_state_dict(lm.model.base_model, state_dict, coef, device=lm.model.base_model.device)
-
-                    lm.model.add_adapter(adapter="place_holder", weight=1/repeat, state_dict=new_state_dict)
-                # evaluate task performances
-                pretrain_state_dict = state_dict
-                lm.model.base_model.load_state_dict(pretrain_state_dict)
-            else:
-                coefs = []
-                for trial in range(repeat):
-                    # load gradients
-                    all_gradients = load_gradient_features(seeds[trial], gradient_idxes)
-                    all_labels = load_labels(seeds[trial], gradient_idxes)
-                    all_outputs = load_outputs(seeds[trial], gradient_idxes)
-                    if len(all_gradients) == 0:
-                        return {}
-                    
-                    # subsample gradients
-                    rng = np.random.default_rng(4)
-                    if all_gradients.shape[0] > args.downsample:
-                        choice_idxes = rng.choice(all_gradients.shape[0], args.downsample, replace=False)
-                        gradients = all_gradients[choice_idxes]
-                        labels = all_labels[choice_idxes]
-                        outputs = all_outputs[choice_idxes]
-                    else:
-                        gradients = np.copy(all_gradients)
-                        outputs = np.copy(all_outputs)
-                    
-                    for i in range(2):
-                        print("label distribution", np.sum(labels == i), "for label", i)
-
-                    print("Number of gradients for logistic regression", gradients.shape)
-                    coef = fit_linear_model(gradients, outputs=outputs, seed=seeds[trial])
-                    coefs.append(coef)
+                if len(all_gradients) == 0:
+                    return {}
+                
+                gradients = np.copy(all_gradients)
+                outputs = np.copy(all_outputs) if all_outputs is not None else None
+                print("Number of gradients for logistic regression", gradients.shape)
+                coef = fit_linear_model(gradients, outputs=outputs, seed=seeds[trial], use_customized_process=args.lr_customize)
+                coefs.append(coef)
                 # average the coefficients
                 coefs = np.array(coefs)
                 coef = np.mean(coefs, axis=0)
-                # coef = coef*scale / np.linalg.norm(coef)
-                # print("L2 norm after scaling", np.linalg.norm(coef))
                 
                 # evaluate task performances
                 new_state_dict = generate_state_dict(lm.model, state_dict, coef, device=lm.model.device)
@@ -577,17 +538,18 @@ if __name__ == "__main__":
             batch_size=batch_size,
             inference_batch_size=inference_batch_size,
             max_input_length=args.max_length,
-            val_split_ratio=0.1,
+            val_split_ratio=args.val_split_ratio,
             downsample_ratio=args.downsample_ratio,
             minimum_samples=args.minimum_samples,
-            minimum_samples_validation=args.minimum_samples_validation)
+            minimum_samples_validation=args.minimum_samples_validation,
+            mode=args.mode)
         new_data_module.setup(stage="fit")
 
-        summary = trainer.validate(lm, dataloaders=new_data_module.test_dataloader())[0]
-        # summary = trainer.validate(lm, dataloaders=new_data_module.train_dataloader())[0]
-        print(summary)
-        return summary
-    
+        summary_val = trainer.validate(lm, dataloaders=new_data_module.val_dataloader())[0]
+        print(summary_val)
+        summary_test = None # trainer.validate(lm, dataloaders=new_data_module.test_dataloader())[0]
+        return summary_val, summary_test
+
     if args.load_sample_task_dir is not None:
         sampled_task_dir = os.path.join("./sampled_indices", "{}.txt".format(args.load_sample_task_dir))
 
@@ -597,9 +559,10 @@ if __name__ == "__main__":
                 task_idxes = [int(idx) for idx in line.strip().split()]
                 task_idxes.sort()
 
-                summary = gradient_based_estimation(task_idxes)
+                summary = gradient_based_estimation(task_idxes, repeat=args.num_repeat, seeds=args.compute_gradients_seeds)
                 if not summary:
                     continue
+                summary_val, summary_test = summary
 
                 # write results 
                 for idx in task_idxes:
@@ -608,7 +571,8 @@ if __name__ == "__main__":
                         "Task index": idx,
                         "Task indices": " ".join([str(idx) for idx in task_idxes])
                     }
-                    for key, val in summary.items():
+                    # save for validation results
+                    for key, val in summary_val.items():
                         if args.task_names[idx] in key:
                             tmp_key = key.removeprefix(args.task_names[idx] + "_")
                             result_datapoint[tmp_key] = val
@@ -635,6 +599,7 @@ if __name__ == "__main__":
             summary = gradient_based_estimation(task_idxes, repeat=args.num_repeat, seeds=args.compute_gradients_seeds)
             if not summary:
                 continue
+            summary_val, summary_test = summary
 
             # write results 
             for idx in task_idxes:
@@ -643,7 +608,8 @@ if __name__ == "__main__":
                     "Task index": idx,
                     "Task indices": " ".join([str(idx) for idx in task_idxes])
                 }
-                for key, val in summary.items():
+                # save for validation results
+                for key, val in summary_val.items():
                     if args.task_names[idx] in key:
                         tmp_key = key.removeprefix(args.task_names[idx] + "_")
                         result_datapoint[tmp_key] = val

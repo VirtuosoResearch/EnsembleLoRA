@@ -44,13 +44,13 @@ task_to_benchmark = {
 }
 
 task_to_answer_choices = {
-    "cb": "Yes ||| No ||| Maybe", 
-    "rte": "No ||| Yes", # 
-    "copa": "First ||| Second",
-    "wic": "No ||| Yes",
+    "cb": "Yes ||| No ||| Maybe",
+    "rte":  "Yes ||| No",  
+    "copa": "A ||| B",  
+    "wic": "No ||| Yes", 
     "wsc.fixed": "No ||| Yes",
     "boolq": "No ||| Yes",
-    "multirc": "Yes ||| No", # 
+    "multirc": "Yes ||| No",  
     "winogrande_debiased": "A ||| B",
     "story_cloze": "A ||| B",
     "hellaswag": "A ||| B ||| C ||| D",
@@ -79,14 +79,14 @@ task_to_instruction_template = {
 
       D: {{ endings[3] }}
 
-      ||| {{ answer_choices[label | int()] }}''',
+      Answer: ||| {{ answer_choices[label | int()] }}''',
 
     "story_cloze": '''
     {{input_sentence_1}} {{input_sentence_2}} {{input_sentence_3}} {{input_sentence_4}}
           What is a possible continuation for the story given the following options ? \n
           A: {{sentence_quiz1}} \n
           B: {{sentence_quiz2}}
-          ||| {{answer_choices[answer_right_ending -1]}}
+          Answer: ||| {{answer_choices[answer_right_ending -1]}}
     ''', 
 
     # Conference Resolution
@@ -178,39 +178,31 @@ task_to_instruction_template = {
     # For superGLUE 
 
     "boolq" : '''{{ passage }} Based on the sentences, is it true that {{ question }}? Yes or No or Maybe?
-      |||\n{% if label != -1 %}\n{{ answer_choices[label] }} \n{% endif %}''',
+      Answer: |||\n{% if label != -1 %}\n{{ answer_choices[label] }} \n{% endif %}''',
 
     "cb" : '''{{premise}} Based on the sentences, is it true that {{hypothesis}}? Yes or No or Maybe?
-      ||| {% if label !=-1 %}{{ answer_choices[label] }}{% endif
-      %}''',
+      Answer: |||{% if label !=-1 %}{{ answer_choices[label] }}{%endif%}''',
 
     "wic" : '''{{sentence1}} {{sentence2}} Based on the sentences, is it true that the word "{{word}}" have the same meaning in the two sentences? Yes or No or Maybe?
-      ||| {% if label != -1%}
+      Answer: ||| {% if label != -1%}{{answer_choices[label]}}{% endif %}''',
 
-      {{answer_choices[label]}}
-
-      {% endif %}''',
-
-    "copa" : '''Pick the more likely continuation to the following sentence:
-
-      {{ premise }} {% if question == "cause" %} as a result of: {% else %} as a consequence:
-      {% endif %}
-
-      - {{choice1}}
-
-      - {{choice2}} ||| {% if label != -1 %}{{ answer_choices[label] }}{%endif%}''',
+    "copa" : '''
+    {{ premise }}
+          What is a possible continuation for the story given the following options ? \n
+          A: {{choice1}} \n
+          B: {{choice2}}. 
+          Answer: ||| {% if label != -1 %}{{ answer_choices[label] }}{%endif%}''',
 
     "multirc" : '''{{paragraph}} {{question}} Based on the sentences, is it true that {{answer}}? Yes or No or Maybe? 
-      |||
-      {% if label != -1 %}{{answer_choices[label]}}{% endif %}''',
+      Answer: ||| {% if label != -1 %}{{answer_choices[label]}}{% endif %}''',
 
     "wsc.fixed" : '''{{ text }} Based on the sentences, is it true that the pronoun "{{ span2_text.lower()
       }}" refer to {{ span1_text }}? Yes or No or Maybe? 
-      ||| {% if label != -1 %}{{ answer_choices[label]
-      }}{% endif %}''',
+      Answer: ||| {% if label != -1 %}{{ answer_choices[label]}}{% endif %}''',
 
-    "rte" : '''{{premise}} Based on the sentences, is it true that {{hypothesis}}? Yes or No or Maybe? 
-    ||| {% if label != -1 %}{{ answer_choices[label] }}{% endif %}''',
+    "rte" : '''{{premise}} Using only the above description and what you know about the
+      world, is "{{hypothesis}}" definitely correct? Yes or no? 
+      Answer: ||| {% if label != -1 %}{{ answer_choices[label] }}{% endif %}''',
 
     "record" : '''Summary:\n\n- {{ passage.split(\"@highlight\")[1:] | join(\"\\n- \") }}
        \n\nArticle:\n\n{{ passage.split(\"@highlight\")[0] }}\n\nNow that you've

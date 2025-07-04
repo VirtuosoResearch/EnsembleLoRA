@@ -80,6 +80,11 @@ class GLUEMultitaskModel(pl.LightningModule):
             self.gradients_dir = f"./gradients/{gradients_dir}"
             if not os.path.exists(self.gradients_dir):
                 os.makedirs(self.gradients_dir)
+
+            for task_name in self.task_names:
+                task_dir = os.path.join(self.gradients_dir, task_name)
+                if not os.path.exists(task_dir):
+                    os.makedirs(task_dir)
             self.initialize_project_matrix(compute_gradients_seeds[0])
         self.param_names = [name for name, param in model.named_parameters() if param.requires_grad]
         self.compute_gradients_steps = compute_gradients_steps
@@ -91,8 +96,11 @@ class GLUEMultitaskModel(pl.LightningModule):
         """
         print("Creating project matrix with dimensions: ", self.gradients_dim, self.project_gradients_dim, "seed: ", seed)
         np.random.seed(seed)
-        self.project_matrix = (2 * np.random.randint(2, size=(self.gradients_dim, self.project_gradients_dim)) - 1).astype(float)
-        self.project_matrix *= 1 / np.sqrt(self.project_gradients_dim)
+        if self.project_gradients_dim < 0:
+            self.project_matrix = None
+        else:
+            self.project_matrix = (2 * np.random.randint(2, size=(self.gradients_dim, self.project_gradients_dim)) - 1).astype(float)
+            self.project_matrix *= 1 / np.sqrt(self.project_gradients_dim)
         self.gradients_dir = self.gradients_dir.replace(f"seed_{self.current_project_seed}", f"seed_{seed}")
         self.current_project_seed = seed
         
@@ -189,15 +197,12 @@ class GLUEMultitaskModel(pl.LightningModule):
             logits = forward_output["logits"][:, :-1].contiguous()
             preds = logits[is_label_mask]
             copy_preds = preds.clone()
-            print("preds: ", torch.softmax(preds, dim=-1)[:, answer_choices])
             preds = preds[:, answer_choices]
             preds = torch.argmax(preds, dim=-1).cpu().numpy()
 
             labels = batch["labels"][:, 1:][is_label_mask]
-            print("loss: ", torch.nn.functional.cross_entropy(copy_preds, labels))
             for idx, label in enumerate(answer_choices):
                 labels[labels == label] = idx
-            print("labels: ", labels)
             labels = labels.cpu().numpy()
             
             ''' Generate the labels '''
@@ -296,15 +301,18 @@ class GLUEMultitaskModel(pl.LightningModule):
                     for idx, seed in enumerate(self.compute_gradients_seeds): # TODO: This is slow for multiple seeds
                         if seed != self.current_project_seed:
                             self.initialize_project_matrix(seed)
-                        tmp_seed_gradient = (tmp_gradient.reshape(1, -1) @ self.project_matrix).flatten()
+                        if self.project_matrix is None:
+                            tmp_seed_gradient = tmp_gradient
+                        else:
+                            tmp_seed_gradient = (tmp_gradient.reshape(1, -1) @ self.project_matrix).flatten()
                         gradients[idx].append(tmp_seed_gradient)
                 returned_outputs[i, :tmp_outputs.size(0)] = tmp_outputs.clone().detach().cpu().type(torch.float32).numpy()
             gradients = [np.array(gradient) for gradient in gradients]
             converted_labels = converted_labels.cpu().numpy()
             for idx, seed in enumerate(self.compute_gradients_seeds):
-                np.save(f"{self.gradients_dir}/train_batch_{batch_idx}_gradients.npy", gradients[idx])
-            np.save(f"{self.gradients_dir}/train_batch_{batch_idx}_outputs.npy", returned_outputs)
-            np.save(f"{self.gradients_dir}/train_batch_{batch_idx}_labels.npy", converted_labels)
+                np.save(f"{self.gradients_dir}/{task_name}/train_batch_{batch_idx}_gradients.npy", gradients[idx])
+            np.save(f"{self.gradients_dir}/{task_name}/train_batch_{batch_idx}_outputs.npy", returned_outputs)
+            np.save(f"{self.gradients_dir}/{task_name}/train_batch_{batch_idx}_labels.npy", converted_labels)
             forward_output['loss'].detach(); logits.detach()
             forward_output['logits'].detach()
             return {} 
