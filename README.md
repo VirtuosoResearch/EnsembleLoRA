@@ -30,7 +30,6 @@ cd ../
 
 pip install lightning==2.2.5
 pip install pytorch-lightning==2.2.5
-
 ```
 
 ## Usage
@@ -64,7 +63,12 @@ After we generate a partition of tasks, we fine-tune one individual adapter on e
 
 Then, we apply a gradient boosting procedure on the group with a high training error. We use the script `custom_train_boosting_model.py`. 
 
-Finally, we utilize the `EnsembleLorAModule` or the `EnsembleAdapterModule` to combine the trained adapters on top of a quantized pretrained model, by providing the path to each of the adapter weights. 
+- `--train_gradient_boosting` activates the gradient boosting procedure. In addition, we provide an implementation of adaboosting through `--train_adaboosting`. 
+- `--n_estimators` specifies the number of boosting steps. 
+- `--gradient_boosting_lr` specifies the learning rate of each boosting step. 
+- `--lr_alpha` specifies the L2 regularization strength in solving the linear regression in each boosting step. 
+
+Finally, we apply a weighted combination of the trained adapters on top of a quantized pretrained model, by providing the path to each of the adapter weights. 
 
 We evaluate the memory cost of the ensemble models with  `measure_memory.py`. 
 
@@ -78,12 +82,9 @@ First, we evaluate and project gradients over all training samples through the s
 - `--model_key` indicates the model name from the huggingface website
 - `--save_name` indicates the name of the path to save the projected gradients 
 - `--seed` indicates the seed to generate the projection matrix. 
-
 - `--project_dimension` indicates the projection dimension of the gradients. 
 
 Estimate linear regression models on subsets of clusters: `./script/alpaca/eval_approximation_err.sh`
-
-
 
 Second, we evaluate the first-order approximation errors by using the projected gradients. This is also implemented in the script `fast_estimate_eval_approximation.py` . Please see the example script in`/scripts/eval_errors.sh`. The important command arguments are as follows: 
 
@@ -97,7 +98,7 @@ If you find this repository useful or happen to use it in a research paper, plea
 @article{Li2025efficient,
   title={Efficient Ensemble for Fine-tuning Language Models on Multiple Datasets},
   author={Li, Dongyue and Zhang, Ziniu and Wang, Lu and Zhang, Hongyang R},
-  booktitle={Proceedings of the 63rd Annual Meeting of the Association for Computational Linguistics (Volume 1: Long Papers)},
+  booktitle={Annual Meeting of the Association for Computational Linguistics (ACL)},
   year={2025},
 }
 ```
